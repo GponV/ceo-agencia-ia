@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Descubre [NOMBRE DEL NEGOCIO], un espacio local para [SERVICIO PRINCIPAL]."
+    />
+    <meta name="theme-color" content="#f7f6f2" />
+    <title>[NOMBRE DEL NEGOCIO] — [FRASE CORTA]</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      body {
+        font-family: "DM Sans", sans-serif;
+      }
+      h1,
+      h2,
+      h3,
+      .serif {
+        font-family: "Playfair Display", serif;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+    </style>
+  </head>
+  <body class="bg-[#f7f6f2] text-[#20251f] antialiased">
+    <header class="mx-auto flex max-w-7xl items-center justify-between px-6 py-5 lg:px-10">
+      <a href="#" class="flex items-center gap-3" aria-label="Inicio">
+        <span class="grid h-10 w-10 place-items-center rounded-full bg-[#244d3c] text-sm font-bold text-white">N</span>
+        <span class="font-semibold tracking-tight">[NOMBRE DEL NEGOCIO]</span>
+      </a>
+      <nav class="hidden items-center gap-8 text-sm text-stone-600 md:flex">
+        <a class="transition hover:text-[#244d3c]" href="#servicios">Servicios</a>
+        <a class="transition hover:text-[#244d3c]" href="#nosotros">Nosotros</a>
+        <a class="transition hover:text-[#244d3c]" href="#contacto">Contacto</a>
+      </nav>
+      <a
+        href="#reservar"
+        class="rounded-full bg-[#244d3c] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#183a2c]"
+      >Reserva tu visita</a>
+    </header>
+
+    <main>
+      <section class="mx-auto grid max-w-7xl items-center gap-12 px-6 pb-20 pt-10 lg:grid-cols-[1fr_0.9fr] lg:px-10 lg:pb-28 lg:pt-16">
+        <div class="max-w-2xl">
+          <p class="mb-6 inline-flex items-center gap-2 rounded-full border border-[#d9ded6] bg-white/70 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#426451]">
+            <span class="h-2 w-2 rounded-full bg-[#c68b55]"></span>
+            [BARRIO O CIUDAD] · [CATEGORÍA]
+          </p>
+          <h1 class="serif text-5xl leading-[1.08] tracking-tight sm:text-6xl lg:text-7xl">
+            [UNA EXPERIENCIA QUE TUS CLIENTES RECORDARÁN]
+          </h1>
+          <p class="mt-6 max-w-xl text-lg leading-8 text-stone-600">
+            [Describe en una frase qué haces, para quién y qué hace especial a tu negocio.]
+          </p>
+          <div class="mt-9 flex flex-wrap items-center gap-4">
+            <a href="#reservar" class="rounded-full bg-[#244d3c] px-7 py-4 text-sm font-semibold text-white shadow-lg shadow-[#244d3c]/10 transition hover:-translate-y-0.5 hover:bg-[#183a2c]">
+              Reserva ahora <span aria-hidden="true">→</span>
+            </a>
+            <a href="#servicios" class="rounded-full border border-stone-300 px-7 py-4 text-sm font-semibold transition hover:border-[#244d3c] hover:text-[#244d3c]">
+              Descubre nuestros servicios
+            </a>
+          </div>
+          <div class="mt-10 flex flex-wrap gap-x-8 gap-y-3 text-sm text-stone-600">
+            <span><strong class="text-[#20251f]">★★★★★</strong> [4.9/5 · número] reseñas</span>
+            <span>✓ Atención cercana</span>
+            <span>✓ [Años] años en [ciudad]</span>
+          </div>
+        </div>
+
+        <div class="relative">
+          <div class="absolute -right-3 -top-3 h-28 w-28 rounded-full bg-[#e8d8c3] sm:-right-6 sm:-top-6 sm:h-40 sm:w-40"></div>
+          <img
+            class="relative h-[420px] w-full rounded-[2rem] object-cover shadow-2xl shadow-stone-900/10 sm:h-[540px]"
+            src="https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=1200&q=85"
+            alt="Interior acogedor de [NOMBRE DEL NEGOCIO]"
+          />
+          <div class="absolute -bottom-5 left-4 max-w-xs rounded-2xl bg-white p-5 shadow-xl sm:-left-8 sm:p-6">
+            <p class="serif text-xl">“[Una frase breve de un cliente satisfecho.]”</p>
+            <p class="mt-2 text-xs font-medium uppercase tracking-wider text-stone-500">[Nombre del cliente] · Cliente</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="servicios" class="bg-white py-20 sm:py-24">
+        <div class="mx-auto max-w-7xl px-6 lg:px-10">
+          <div class="flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
+            <div>
+              <p class="text-xs font-bold uppercase tracking-[0.18em] text-[#9a7049]">Lo que hacemos</p>
+              <h2 class="serif mt-3 text-4xl sm:text-5xl">Un servicio pensado para ti.</h2>
+            </div>
+            <p class="max-w-md leading-7 text-stone-600">[Una breve introducción a tus servicios y a cómo ayudan a tus clientes.]</p>
+          </div>
+          <div class="mt-12 grid gap-5 md:grid-cols-3">
+            <article class="rounded-3xl border border-stone-200 p-7 transition hover:-translate-y-1 hover:shadow-lg">
+              <span class="text-2xl" aria-hidden="true">01</span>
+              <h3 class="serif mt-8 text-2xl">[Servicio principal]</h3>
+              <p class="mt-3 leading-7 text-stone-600">[Beneficio claro para el cliente. Añade duración o detalles si corresponde.]</p>
+              <p class="mt-6 text-sm font-semibold text-[#244d3c]">Desde [precio] · [duración]</p>
+            </article>
+            <article class="rounded-3xl border border-stone-200 p-7 transition hover:-translate-y-1 hover:shadow-lg">
+              <span class="text-2xl" aria-hidden="true">02</span>
+              <h3 class="serif mt-8 text-2xl">[Servicio destacado]</h3>
+              <p class="mt-3 leading-7 text-stone-600">[Cuenta qué incluye y para quién es ideal.]</p>
+              <p class="mt-6 text-sm font-semibold text-[#244d3c]">Desde [precio] · [duración]</p>
+            </article>
+            <article class="rounded-3xl border border-stone-200 p-7 transition hover:-translate-y-1 hover:shadow-lg">
+              <span class="text-2xl" aria-hidden="true">03</span>
+              <h3 class="serif mt-8 text-2xl">[Experiencia especial]</h3>
+              <p class="mt-3 leading-7 text-stone-600">[Presenta una opción adicional, paquete o experiencia única.]</p>
+              <p class="mt-6 text-sm font-semibold text-[#244d3c]">Desde [precio] · [duración]</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="nosotros" class="mx-auto grid max-w-7xl gap-10 px-6 py-20 sm:py-24 lg:grid-cols-2 lg:items-center lg:px-10">
+        <div class="overflow-hidden rounded-[2rem] bg-[#e8e4da]">
+          <img
+            class="h-[360px] w-full object-cover sm:h-[440px]"
+            src="https://images.unsplash.com/photo-1521737711867-e3b97375f902?auto=format&fit=crop&w=1200&q=85"
+            alt="El equipo de [NOMBRE DEL NEGOCIO]"
+            loading="lazy"
+          />
+        </div>
+        <div class="lg:pl-8">
+          <p class="text-xs font-bold uppercase tracking-[0.18em] text-[#9a7049]">Nuestra historia</p>
+          <h2 class="serif mt-3 text-4xl leading-tight sm:text-5xl">[Un negocio local, hecho con pasión.]</h2>
+          <p class="mt-6 leading-8 text-stone-600">[Comparte quiénes son, por qué empezaron y qué pueden esperar los clientes. Mantén el tono humano y concreto.]</p>
+          <a href="#contacto" class="mt-7 inline-flex items-center gap-2 text-sm font-semibold text-[#244d3c]">Ven a conocernos <span aria-hidden="true">→</span></a>
+        </div>
+      </section>
+
+      <section id="reservar" class="bg-[#eaece5] py-20 sm:py-24">
+        <div class="mx-auto grid max-w-7xl gap-10 px-6 lg:grid-cols-[0.9fr_1.1fr] lg:px-10">
+          <div>
+            <p class="text-xs font-bold uppercase tracking-[0.18em] text-[#9a7049]">Da el primer paso</p>
+            <h2 class="serif mt-3 text-4xl leading-tight sm:text-5xl">Tu próxima visita empieza aquí.</h2>
+            <p class="mt-5 max-w-md leading-7 text-stone-600">[Invita a reservar o consultar. Responde pronto y ayuda a cada cliente a elegir el servicio adecuado.]</p>
+            <p class="mt-8 text-sm font-semibold text-[#244d3c]">[Días y horario de atención]</p>
+            <p class="mt-2 text-sm text-stone-600">[Dirección], [ciudad]</p>
+          </div>
+          <div class="rounded-3xl bg-white p-6 shadow-sm sm:p-9">
+            <h3 class="serif text-2xl">Solicita una reserva</h3>
+            <p class="mt-2 text-sm leading-6 text-stone-600">Cuéntanos qué necesitas y te confirmaremos disponibilidad.</p>
+            <form class="mt-6 grid gap-4 sm:grid-cols-2">
+              <label class="text-sm font-medium">Tu nombre
+                <input type="text" name="nombre" autocomplete="name" placeholder="Nombre y apellido" class="mt-2 w-full rounded-xl border border-stone-200 bg-[#fbfbf9] px-4 py-3 font-normal outline-none transition focus:border-[#244d3c]" />
+              </label>
+              <label class="text-sm font-medium">Tu teléfono
+                <input type="tel" name="telefono" autocomplete="tel" placeholder="+1 555 000 0000" class="mt-2 w-full rounded-xl border border-stone-200 bg-[#fbfbf9] px-4 py-3 font-normal outline-none transition focus:border-[#244d3c]" />
+              </label>
+              <label class="text-sm font-medium sm:col-span-2">Servicio que te interesa
+                <select name="servicio" class="mt-2 w-full rounded-xl border border-stone-200 bg-[#fbfbf9] px-4 py-3 font-normal outline-none transition focus:border-[#244d3c]">
+                  <option value="">Selecciona una opción</option>
+                  <option>[Servicio principal]</option>
+                  <option>[Servicio destacado]</option>
+                  <option>Quiero más información</option>
+                </select>
+              </label>
+              <a href="[ENLACE_DE_RESERVA_O_WHATSAPP]" class="mt-1 rounded-full bg-[#244d3c] px-6 py-4 text-center text-sm font-semibold text-white transition hover:bg-[#183a2c] sm:col-span-2">
+                Continuar por WhatsApp
+              </a>
+            </form>
+            <p class="mt-4 text-xs leading-5 text-stone-500">Prototipo: conecta el formulario y sustituye el enlace de reserva por el canal real del negocio antes de usarlo con clientes.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="contacto" class="mx-auto flex max-w-7xl flex-col gap-6 px-6 py-14 sm:flex-row sm:items-center sm:justify-between lg:px-10">
+        <div>
+          <p class="serif text-2xl">[NOMBRE DEL NEGOCIO]</p>
+          <p class="mt-1 text-sm text-stone-600">[Dirección] · [Ciudad, país]</p>
+        </div>
+        <div class="flex flex-wrap gap-x-6 gap-y-3 text-sm">
+          <a class="font-semibold text-[#244d3c] hover:underline" href="tel:[TELEFONO]">[TELÉFONO]</a>
+          <a class="text-stone-600 hover:text-[#244d3c]" href="mailto:[CORREO]">[CORREO]</a>
+          <a class="text-stone-600 hover:text-[#244d3c]" href="[ENLACE_INSTAGRAM]">Instagram</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="border-t border-stone-200 px-6 py-6 text-center text-xs text-stone-500">
+      © [AÑO] [NOMBRE DEL NEGOCIO]. Todos los derechos reservados.
+    </footer>
+  </body>
+</html>
