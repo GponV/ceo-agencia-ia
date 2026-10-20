@@ -1,4 +1,4 @@
-# Aprobación pendiente: endpoint Green-API para Streamlit Cloud
+# Aprobación: endpoint Green-API para Streamlit Cloud
 
 ## Cambio propuesto
 
