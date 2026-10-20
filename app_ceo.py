@@ -109,6 +109,13 @@ STATUS_LABELS = {
 }
 
 
+def pending_prototype_count(state: dict) -> int:
+    return sum(
+        record.get("status") in ("pending", "changes_requested")
+        for record in state["prototypes"]
+    )
+
+
 def default_state() -> dict:
     return {
         "prototypes": [],
@@ -1719,66 +1726,64 @@ def render_sidebar_settings(state: dict) -> None:
             unsafe_allow_html=True,
         )
         st.caption(f"Correo oficial de soporte: {support_email_visual()}")
-        with st.form("agency_settings_form"):
-            prototype_base_url = st.text_input(
-                "URL pública autorizada para demos",
-                value=settings.get("prototype_base_url", ""),
-                placeholder="https://demos.apexaiagency.com",
-                help=(
-                    "Base de una instancia autorizada que sirve app_ceo.py. No uses "
-                    "localhost para compartir con prospectos."
-                ),
-            )
-            st.markdown("**Enlaces oficiales de pago**")
-            payment_links = {}
-            for method in PAYMENT_OPTIONS:
-                payment_links[method] = st.text_input(
-                    method,
-                    value=settings["payment_links"].get(method, ""),
-                    placeholder="https://…",
-                    key=f"payment_url_{slugify(method)}",
+        with st.expander("Configuración de publicación y pagos", expanded=False):
+            with st.form("agency_settings_form"):
+                prototype_base_url = st.text_input(
+                    "URL pública autorizada para demos",
+                    value=settings.get("prototype_base_url", ""),
+                    placeholder="https://demos.apexaiagency.com",
+                    help=(
+                        "Base de una instancia autorizada que sirve app_ceo.py. No uses "
+                        "localhost para compartir con prospectos."
+                    ),
                 )
-            save_settings = st.form_submit_button(
-                "Guardar configuración", use_container_width=True
-            )
-            if save_settings:
-                invalid_urls = [
-                    label
-                    for label, url in [
-                        ("URL pública de demos", prototype_base_url),
-                        *payment_links.items(),
+                st.markdown("**Enlaces oficiales de pago**")
+                payment_links = {}
+                for method in PAYMENT_OPTIONS:
+                    payment_links[method] = st.text_input(
+                        method,
+                        value=settings["payment_links"].get(method, ""),
+                        placeholder="https://…",
+                        key=f"payment_url_{slugify(method)}",
+                    )
+                save_settings = st.form_submit_button(
+                    "Guardar configuración", use_container_width=True
+                )
+                if save_settings:
+                    invalid_urls = [
+                        label
+                        for label, url in [
+                            ("URL pública de demos", prototype_base_url),
+                            *payment_links.items(),
+                        ]
+                        if url.strip()
+                        and (
+                            not valid_web_url(url)
+                            or urlparse(url).scheme != "https"
+                        )
                     ]
-                    if url.strip()
-                    and (
-                        not valid_web_url(url)
-                        or urlparse(url).scheme != "https"
-                    )
-                ]
-                if invalid_urls:
-                    st.error(
-                        "Usa URLs HTTPS completas para la demo y los enlaces de pago: "
-                        + ", ".join(invalid_urls)
-                    )
-                else:
-                    settings["prototype_base_url"] = prototype_base_url.strip()
-                    settings["payment_links"] = {
-                        method: url.strip() for method, url in payment_links.items()
-                    }
-                    save_state(state)
-                    st.session_state["flash_message"] = (
-                        "Enlaces de demo y pago guardados localmente."
-                    )
-                    st.rerun()
+                    if invalid_urls:
+                        st.error(
+                            "Usa URLs HTTPS completas para la demo y los enlaces de pago: "
+                            + ", ".join(invalid_urls)
+                        )
+                    else:
+                        settings["prototype_base_url"] = prototype_base_url.strip()
+                        settings["payment_links"] = {
+                            method: url.strip() for method, url in payment_links.items()
+                        }
+                        save_state(state)
+                        st.session_state["flash_message"] = (
+                            "Enlaces de demo y pago guardados localmente."
+                        )
+                        st.rerun()
         st.warning(
             "Enlaces de demo externos solo después de aprobar el despliegue. "
             "No compartas públicamente una instancia del CEO Dashboard sin protegerla."
         )
         st.divider()
         st.markdown("**Estado de la fábrica**")
-        pending_count = sum(
-            record.get("status") in ("pending", "changes_requested", "sending")
-            for record in state["prototypes"]
-        )
+        pending_count = pending_prototype_count(state)
         st.metric("Propuestas por revisar", pending_count)
         st.caption(
             "Los mensajes salen solo tras acciones explícitas; los pagos no se procesan aquí."
@@ -1860,7 +1865,19 @@ def render_recent_purchase_notifications(state: dict) -> None:
     st.markdown("### 🔔 Notificaciones de Compras Recientes")
     recent = state["purchase_notifications"][:8]
     if not recent:
-        st.caption("Todavía no hay reportes de pago o compras registradas.")
+        with st.container(border=True):
+            icon_col, message_col = st.columns([1, 8])
+            with icon_col:
+                st.markdown(
+                    '<div class="empty-activity-icon">✦</div>',
+                    unsafe_allow_html=True,
+                )
+            with message_col:
+                st.markdown("**Tu actividad empieza aquí**")
+                st.caption(
+                    "Aún no hay reportes de compra. Lanza tu primera operación desde "
+                    "la pestaña «Lanzar Operación» y las notificaciones aparecerán aquí."
+                )
         return
     for notification in recent:
         verified = notification.get("status") == "verified"
@@ -2067,6 +2084,26 @@ def main() -> None:
         .sidebar-brand .apex-brand-copy strong { font-size: 1.05rem; color: white; }
         .sidebar-brand .apex-brand-copy small { color: var(--apex-cyan); }
         .sidebar-role { display: block; margin: .75rem 0 0 .2rem; color: #8493a7; font-size: .65rem; font-weight: 700; letter-spacing: .18em; }
+        .apex-brand { color: #fff !important; }
+        .apex-brand-copy strong { color: #f8fbff !important; }
+        .apex-brand-copy small { color: #00F2FE !important; }
+        .empty-activity-icon {
+            display: grid; width: 2.5rem; height: 2.5rem; place-items: center;
+            border: 1px solid #00f2fe55; border-radius: 14px;
+            background: linear-gradient(145deg, #112b36, #111b28);
+            color: #00F2FE; font-size: 1.25rem;
+        }
+        .engine-status {
+            display: inline-flex; align-items: center; gap: .55rem;
+            margin: .4rem 0 1.2rem; padding: .42rem .72rem;
+            border: 1px solid #10b98155; border-radius: 999px;
+            background: #10b98112; color: #b5f5dd;
+            font-size: .78rem; font-weight: 650; letter-spacing: .01em;
+        }
+        .engine-status-dot {
+            width: .48rem; height: .48rem; border-radius: 50%;
+            background: #10B981; box-shadow: 0 0 12px #10b981aa;
+        }
         h1, h2, h3 { letter-spacing: -.025em; }
         h1 { color: #f7fbff; }
         [data-testid="stCaptionContainer"], [data-testid="stMarkdownContainer"] p { color: #aebacc; }
@@ -2147,17 +2184,26 @@ def main() -> None:
         st.stop()
 
     render_sidebar_settings(state)
-    st.title(f"{AGENCY_NAME} — CEO Command Center")
+    title_column, status_column = st.columns([3, 2], vertical_alignment="center")
+    with title_column:
+        st.title(f"{AGENCY_NAME} — CEO Command Center")
+    with status_column:
+        st.markdown(
+            '<div class="engine-status"><span class="engine-status-dot"></span>'
+            "⚡ Motor de Agentes: Activo</div>",
+            unsafe_allow_html=True,
+        )
     st.caption("Centro de mando de Apex AI Agency para prototipos, aprobaciones y operaciones.")
     flash = st.session_state.pop("flash_message", None)
     if flash:
         st.success(flash)
     render_recent_purchase_notifications(state)
 
+    pending_count = pending_prototype_count(state)
     factory_tab, approval_tab, finance_tab = st.tabs(
         [
             "🏭 Lanzar Operación (Fábrica)",
-            "🛡️ Bandeja de Aprobación del CEO (Human-in-the-Loop)",
+            f"🛡️ Bandeja de Aprobación ({pending_count})",
             "💰 Control Financiero y Mantenimiento ($)",
         ]
     )
