@@ -170,35 +170,34 @@ def required_secret(name: str) -> str:
     return value
 
 
-def notificar_ceo_whatsapp(mensaje: str) -> None:
-    api_id = required_secret("GREEN_API_ID")
-    api_token = required_secret("GREEN_API_TOKEN")
-    chat_id = f"{required_secret('CEO_WHATSAPP')}"
-    if not re.fullmatch(r"\d+@c\.us", chat_id):
-        raise RuntimeError(
-            "CEO_WHATSAPP debe ser el chatId personal con formato numérico y sufijo @c.us."
-        )
-    clean_message = mensaje.strip()
-    if not clean_message:
-        raise ValueError("El mensaje de WhatsApp no puede estar vacío.")
-    endpoint = (
-        f"https://{api_id}.api.greenapi.com/waInstance{api_id}"
-        f"/sendMessage/{api_token}"
-    )
+def notificar_ceo_whatsapp(mensaje: str) -> str | None:
     try:
+        api_id = required_secret("GREEN_API_ID")
+        api_token = required_secret("GREEN_API_TOKEN")
+        chat_id = f"{required_secret('CEO_WHATSAPP')}"
+        if not re.fullmatch(r"\d+@c\.us", chat_id):
+            raise RuntimeError(
+                "CEO_WHATSAPP debe ser el chatId personal con formato numérico y sufijo @c.us."
+            )
+        clean_message = mensaje.strip()
+        if not clean_message:
+            raise ValueError("El mensaje de WhatsApp no puede estar vacío.")
+        endpoint = (
+            f"https://{api_id}.api.greenapi.com/waInstance{api_id}"
+            f"/sendMessage/{api_token}"
+        )
         response = requests.post(
             endpoint,
             json={"chatId": chat_id, "message": clean_message},
-            timeout=(5, 15),
+            timeout=10,
         )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Falló la conexión con Green-API ({type(exc).__name__})."
-        ) from None
-    if not 200 <= response.status_code < 300:
-        raise RuntimeError(
-            f"Green-API rechazó la notificación (HTTP {response.status_code})."
-        )
+        response.raise_for_status()
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        error_type = "HTTP" if status_code else type(exc).__name__
+        status = f" {status_code}" if status_code else ""
+        return f"Green-API no pudo enviar la notificación ({error_type}{status})."
+    return None
 
 
 def enviar_correo_cliente(destinatario: str, asunto: str, cuerpo: str) -> None:
@@ -1200,8 +1199,12 @@ def render_background_jobs() -> None:
                             save_state(state)
                     refresh_app = True
             else:
-                job["status"] = "succeeded"
-                job["result"] = str(result or "Tarea completada.")
+                if result:
+                    job["status"] = "warning"
+                    job["warning"] = str(result)
+                else:
+                    job["status"] = "succeeded"
+                    job["result"] = "Tarea completada."
                 refresh_app = refresh_app or job["kind"] == "approval"
         elif job["status"] == "queued" and future.running():
             job["status"] = "running"
@@ -1215,6 +1218,8 @@ def render_background_jobs() -> None:
                 st.info(f"⏳ {job['label']}: procesando…")
             elif job["status"] == "succeeded":
                 st.success(f"{job['label']}: {job.get('result', 'Completado.')}")
+            elif job["status"] == "warning":
+                st.warning(f"{job['label']}: {job['warning']}")
             else:
                 st.error(f"{job['label']}: {job['error']}")
     if refresh_app:
