@@ -173,16 +173,22 @@ def required_secret(name: str) -> str:
 def notificar_ceo_whatsapp(mensaje: str) -> None:
     api_id = required_secret("GREEN_API_ID")
     api_token = required_secret("GREEN_API_TOKEN")
-    chat_id = required_secret("CEO_WHATSAPP")
+    chat_id = f"{required_secret('CEO_WHATSAPP')}"
     if not re.fullmatch(r"\d+@c\.us", chat_id):
         raise RuntimeError(
             "CEO_WHATSAPP debe ser el chatId personal con formato numérico y sufijo @c.us."
         )
-    endpoint = f"https://api.green-api.com/waInstance{api_id}/sendMessage/{api_token}"
+    clean_message = mensaje.strip()
+    if not clean_message:
+        raise ValueError("El mensaje de WhatsApp no puede estar vacío.")
+    endpoint = (
+        f"https://{api_id}.api.greenapi.com/waInstance{api_id}"
+        f"/sendMessage/{api_token}"
+    )
     try:
         response = requests.post(
             endpoint,
-            json={"chatId": chat_id, "message": mensaje},
+            json={"chatId": chat_id, "message": clean_message},
             timeout=(5, 15),
         )
     except requests.RequestException as exc:
