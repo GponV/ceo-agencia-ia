@@ -28,6 +28,12 @@ APPROVED_DIR = ROOT / "02_BANDEJA_APROBACION" / "aprobados"
 DATA_DIR = ROOT / ".ceo_dashboard"
 STATE_FILE = DATA_DIR / "state.json"
 AGENCY_NAME = "Apex AI Agency"
+SUPPORT_EMAIL = "hello.apexrepurposing@gmail.com"
+CONTRACT_STATUSES = {
+    "pending_verification": "Pago reportado · pendiente de verificación",
+    "paid_activation": "Pagado · en activación",
+    "delivered_active": "Entregado y activo",
+}
 
 
 @st.cache_resource
@@ -101,6 +107,8 @@ def default_state() -> dict:
         "prototypes": [],
         "income": [],
         "clients": [],
+        "contracts": [],
+        "purchase_notifications": [],
         "settings": {
             "prototype_base_url": "",
             "payment_links": {method: "" for method in PAYMENT_OPTIONS},
@@ -126,12 +134,19 @@ def _load_state() -> dict:
             f"El archivo de datos {STATE_FILE.relative_to(ROOT)} no contiene JSON válido."
         ) from exc
     if not isinstance(state, dict) or any(
-        not isinstance(state.get(key), list) for key in ("prototypes", "income", "clients")
+        not isinstance(state.get(key), list)
+        for key in ("prototypes", "income", "clients")
     ):
         raise ValueError(
             f"El archivo {STATE_FILE.relative_to(ROOT)} no tiene el formato esperado."
         )
     defaults = default_state()
+    for key in ("contracts", "purchase_notifications"):
+        value = state.setdefault(key, [])
+        if not isinstance(value, list):
+            raise ValueError(f"La sección {key} guardada no tiene el formato esperado.")
+        if any(not isinstance(item, dict) for item in value):
+            raise ValueError(f"La sección {key} contiene registros inválidos.")
     settings = state.setdefault("settings", defaults["settings"])
     if not isinstance(settings, dict):
         raise ValueError("La configuración guardada no tiene el formato esperado.")
@@ -169,6 +184,15 @@ def required_secret(name: str) -> str:
     if not value:
         raise RuntimeError(f"El secreto {name} está vacío.")
     return value
+
+
+def support_email_visual() -> str:
+    try:
+        sender = str(st.secrets["SMTP_EMAIL"]).strip()
+    except (KeyError, FileNotFoundError):
+        return SUPPORT_EMAIL
+    parsed = parseaddr(sender)[1]
+    return parsed if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", parsed) else SUPPORT_EMAIL
 
 
 def notificar_ceo_whatsapp(mensaje: str) -> str | None:
@@ -228,16 +252,180 @@ def enviar_correo_cliente(destinatario: str, asunto: str, cuerpo: str) -> None:
     message.set_content(cuerpo)
     try:
         with smtplib.SMTP_SSL(
-            "smtp.gmail.com", 465, timeout=20, context=ssl.create_default_context()
+            "smtp.gmail.com", 465, timeout=10, context=ssl.create_default_context()
         ) as smtp:
             smtp.login(sender, password)
             refused = smtp.send_message(message)
-    except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+    except Exception as exc:
         raise RuntimeError(
             f"No se pudo enviar el correo por SMTP ({type(exc).__name__})."
         ) from None
     if refused:
         raise RuntimeError("El servidor SMTP rechazó el destinatario.")
+
+
+def render_delivery_note(contract: dict) -> str:
+    delivery_date = contract.get("delivery_date") or "Pendiente de coordinar"
+    warranty = contract.get("warranty") or "30 días de soporte correctivo desde la activación."
+    amount = PAYMENT_OPTIONS.get(contract.get("payment_method"), 0)
+    return (
+        f"NOTA DE ENTREGA OFICIAL — {AGENCY_NAME}\n\n"
+        f"Cliente: {contract.get('customer_name', '')}\n"
+        f"Negocio: {contract.get('business_name', '')}\n"
+        f"Fecha de entrega: {delivery_date}\n"
+        f"Pasarela: {contract.get('payment_method', '')}\n"
+        f"Importe registrado: {money(amount)}\n"
+        f"Referencia de pago: {contract.get('payment_reference') or 'No indicada'}\n\n"
+        "SERVICIOS INCLUIDOS\n"
+        f"{contract.get('delivery_details') or 'Sistema de Captación Web; Cotizador IA; Integración WhatsApp'}\n\n"
+        f"Garantía: {warranty}\n\n"
+        "Soporte oficial: hello.apexrepurposing@gmail.com\n\n"
+        f"Documento emitido por el equipo de {AGENCY_NAME}.\n"
+        "Este documento confirma la entrega registrada en nuestro sistema."
+    )
+
+
+def enviar_nota_entrega_cliente(contract: dict) -> None:
+    if (
+        contract.get("status") != "delivered_active"
+        or not contract.get("payment_verified")
+    ):
+        raise ValueError(
+            "La nota oficial requiere pago verificado y contrato entregado y activo."
+        )
+    recipient = contract.get("customer_email", "").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient):
+        raise ValueError("El contrato no contiene un correo válido del cliente.")
+    subject = f"Nota de Entrega Oficial — {AGENCY_NAME} — {contract.get('business_name', '')}"
+    enviar_correo_cliente(recipient, subject, render_delivery_note(contract))
+
+
+def notificar_compra_ceo(datos_compra: dict) -> dict:
+    required_fields = ("business_name", "customer_name", "customer_email", "payment_method")
+    if any(not str(datos_compra.get(field, "")).strip() for field in required_fields):
+        raise ValueError("Faltan datos obligatorios para registrar la solicitud de compra.")
+    method = datos_compra["payment_method"]
+    if method not in PAYMENT_OPTIONS:
+        raise ValueError("Selecciona una pasarela de pago oficial.")
+    amount_cents = PAYMENT_OPTIONS[method]
+    payment_verified = bool(datos_compra.get("payment_verified", False))
+    contract_id = uuid.uuid4().hex
+    notification = {
+        "id": uuid.uuid4().hex,
+        "contract_id": contract_id,
+        "business_name": datos_compra["business_name"].strip(),
+        "customer_name": datos_compra["customer_name"].strip(),
+        "customer_email": datos_compra["customer_email"].strip(),
+        "payment_method": method,
+        "amount_cents": amount_cents,
+        "payment_reference": datos_compra.get("payment_reference", "").strip(),
+        "notes": datos_compra.get("notes", "").strip(),
+        "delivery_note_requested": bool(datos_compra.get("delivery_note_requested")),
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": "verified" if payment_verified else "pending_verification",
+    }
+    contract = {
+        "id": contract_id,
+        "prototype_id": datos_compra.get("prototype_id", ""),
+        "business_name": notification["business_name"],
+        "customer_name": notification["customer_name"],
+        "customer_email": notification["customer_email"],
+        "payment_method": method,
+        "amount_cents": amount_cents,
+        "payment_reference": notification["payment_reference"],
+        "customer_notes": notification["notes"],
+        "status": "paid_activation" if payment_verified else "pending_verification",
+        "payment_verified": payment_verified,
+        "delivery_note_requested": notification["delivery_note_requested"],
+        "created_at": notification["created_at"],
+        "delivery_date": "",
+        "warranty": "30 días de soporte correctivo desde la activación.",
+        "internal_notes": "",
+    }
+    with STATE_LOCK:
+        state = load_state()
+        reference = notification["payment_reference"]
+        duplicate = reference and any(
+            item.get("business_name") == notification["business_name"]
+            and item.get("payment_reference") == reference
+            for item in state["purchase_notifications"]
+        )
+        if duplicate:
+            raise ValueError(
+                "Ya existe un registro con esa referencia de pago para este negocio."
+            )
+        state["purchase_notifications"].insert(0, notification)
+        state["contracts"].append(contract)
+        save_state(state)
+
+    subject = (
+        f"💰 ¡NUEVA COMPRA EN {AGENCY_NAME.upper()}! - "
+        f"{notification['business_name']} ({amount_cents / 100:.0f} USD)"
+    )
+    body = (
+        (
+            "Pago marcado como verificado manualmente por el CEO.\n\n"
+            if payment_verified
+            else "Se recibió un reporte de pago/solicitud de activación; no implica "
+            "verificación automática de la transacción.\n\n"
+        )
+        + f"Negocio: {notification['business_name']}\n"
+        + f"Cliente: {notification['customer_name']}\n"
+        + f"Correo: {notification['customer_email']}\n"
+        + f"Pasarela: {method} — {amount_cents / 100:.0f} USD\n"
+        + f"Referencia: {notification['payment_reference'] or 'No indicada'}\n"
+        + f"Notas: {notification['notes'] or 'Ninguna'}\n"
+        + f"Nota de entrega solicitada: {'Sí' if notification['delivery_note_requested'] else 'No'}\n\n"
+        + (
+            "Se registró el importe en el libro de ingresos."
+            if payment_verified
+            else "Verifica el pago antes de actualizar el contrato."
+        )
+    )
+    enqueue_background_job(
+        f"Alerta de compra por correo: {notification['business_name']}",
+        enviar_correo_cliente,
+        SUPPORT_EMAIL,
+        subject,
+        body,
+    )
+    verification_message = (
+        "Pago verificado manualmente."
+        if payment_verified
+        else "Pago reportado, pendiente de verificación."
+    )
+    whatsapp_message = (
+        f"💰 ¡NUEVA COMPRA EN {AGENCY_NAME.upper()}! - {notification['business_name']} "
+        f"({amount_cents / 100:.0f} USD). {verification_message}"
+    )
+    enqueue_background_job(
+        f"Alerta de compra por WhatsApp: {notification['business_name']}",
+        notificar_ceo_whatsapp,
+        whatsapp_message,
+    )
+    if notification["delivery_note_requested"]:
+        payment_message = (
+            "Tu pago fue verificado. La Nota de Entrega Oficial se enviará cuando el "
+            "sistema esté entregado y activo."
+            if payment_verified
+            else "El pago figura como pendiente de verificación; por eso este mensaje no es "
+            "un comprobante de pago ni confirma que el sistema ya fue entregado."
+        )
+        acknowledgement = (
+            f"Hola, {notification['customer_name']}:\n\n"
+            f"Recibimos tu solicitud de activación y de Nota de Entrega para "
+            f"{notification['business_name']}. {payment_message} Cuando la entrega "
+            "sea confirmada, enviaremos la Nota de Entrega Oficial.\n\n"
+            f"Soporte: {SUPPORT_EMAIL}\nEquipo de {AGENCY_NAME}"
+        )
+        enqueue_background_job(
+            f"Acuse de solicitud: {notification['business_name']}",
+            enviar_correo_cliente,
+            notification["customer_email"],
+            f"Solicitud recibida — {AGENCY_NAME}",
+            acknowledgement,
+        )
+    return notification
 
 
 def enqueue_background_job(
@@ -271,6 +459,14 @@ def enqueue_background_job(
 
 def money(cents: int) -> str:
     return f"${cents / 100:,.2f} USD"
+
+
+def valid_iso_date(value: str) -> bool:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.isoformat() == value
 
 
 def safe_text(value: str) -> str:
@@ -311,6 +507,8 @@ def make_prototype_html(
     business = safe_text(name)
     category = safe_text(service)
     location = safe_text(zone)
+    support_email = safe_text(SUPPORT_EMAIL)
+    niche_type = "clinic" if "Madrid" in zone else "home_service"
     payment_links = payment_links or {}
     payment_rows = []
     for method, cents in PAYMENT_OPTIONS.items():
@@ -378,12 +576,16 @@ def make_prototype_html(
       .payment-link small{{display:block;margin-top:.2rem;color:#78716c;font-weight:400}}
       .whatsapp-float{{position:fixed;right:1.25rem;bottom:1.25rem;z-index:40;max-width:calc(100vw - 2.5rem);border-radius:999px;background:#15803d;padding:.9rem 1.2rem;color:white;font-size:.85rem;font-weight:700;text-align:center;text-decoration:none;box-shadow:0 8px 24px #0003}}
       .whatsapp-float:hover{{background:#166534}}
+      .simulator-card{{border:1px solid #e7e5e4;border-radius:1.25rem;background:#fff;padding:1.25rem}}
+      .simulator-card input,.simulator-card select{{width:100%;border:1px solid #d6d3d1;border-radius:.65rem;padding:.7rem;margin:.35rem 0 .8rem}}
+      .simulator-result{{border-radius:.75rem;background:#ecfdf5;padding:.9rem;color:#14532d;font-weight:700}}
+      .faq-item{{border-bottom:1px solid #e7e5e4;padding:1rem 0}}
       @media(max-width:520px){{.preview-toolbar{{align-items:flex-start;flex-direction:column}}body{{padding-top:116px}}.payment-list{{left:0;right:auto}}}}
     </style>
   </head>
   <body class="bg-stone-50 text-stone-900 antialiased">
     <aside class="preview-toolbar">
-      <p>⚡ Vista previa exclusiva creada por Apex AI Agency para {business}</p>
+      <p>⚡ Vista previa exclusiva creada por Apex AI Agency para {business} — Prototipo reservado por tiempo limitado (Expira en 48h) · {support_email}</p>
       <details class="payment-menu"{details_open}>
         <summary>🚀 Activar en mi dominio hoy</summary>
         <div class="payment-list" aria-label="Opciones de pago">
@@ -419,6 +621,32 @@ def make_prototype_html(
           </div>
         </div>
       </section>
+      <section class="mx-auto max-w-6xl px-6 py-16">
+        <p class="text-sm font-bold uppercase tracking-[.18em] text-emerald-800">Pruébalo en vivo</p>
+        <h2 class="mt-3 text-4xl">Herramientas interactivas</h2>
+        <p class="mt-3 max-w-2xl text-stone-600">Simulaciones orientativas para mostrar cómo podría ayudar un sitio activo. Los valores no son cotizaciones finales ni una reserva real.</p>
+        <div class="mt-8 grid gap-6 md:grid-cols-2">
+          <article class="simulator-card">
+            <h3 class="text-2xl">Calculadora de presupuestos instantánea</h3>
+            <label for="estimate-service" class="text-sm font-semibold">Servicio</label>
+            <select id="estimate-service"></select>
+            <label for="estimate-units" class="text-sm font-semibold">Cantidad / sesiones</label>
+            <input id="estimate-units" type="number" min="1" max="20" value="1">
+            <div id="estimate-result" class="simulator-result" aria-live="polite">Estimación orientativa</div>
+          </article>
+          <article class="simulator-card">
+            <h3 class="text-2xl">Simulador de asistente IA 24/7</h3>
+            <label for="assistant-question" class="text-sm font-semibold">Prueba una pregunta habitual</label>
+            <select id="assistant-question">
+              <option value="price">¿Cuánto cuesta y qué incluye?</option>
+              <option value="availability">¿Tienen disponibilidad esta semana?</option>
+              <option value="appointment">Quiero reservar una cita</option>
+            </select>
+            <div id="assistant-result" class="simulator-result" aria-live="polite"></div>
+            <p class="mt-3 text-sm text-stone-500">Ejemplo de interacción; no envía mensajes ni agenda citas.</p>
+          </article>
+        </div>
+      </section>
       <section id="contacto" class="mx-auto max-w-6xl px-6 py-16">
         <div class="rounded-[2rem] bg-emerald-950 p-8 text-white md:p-12">
           <h2 class="text-4xl">¿Hablamos de lo que necesitas?</h2>
@@ -428,8 +656,46 @@ def make_prototype_html(
         </div>
       </section>
     </main>
-    <footer class="border-t border-stone-200 px-6 py-6 text-center text-xs text-stone-500">© 2026 {business} · Concepto de demostración sin conexión de reservas.</footer>
+    <footer class="border-t border-stone-200 px-6 py-6 text-center text-xs text-stone-500">© 2026 {business} · Concepto de demostración sin conexión de reservas · Vista creada por {AGENCY_NAME} · <a href="mailto:{support_email}">{support_email}</a></footer>
     {whatsapp_button}
+    <script>
+      const nicheType = "{niche_type}";
+      const services = nicheType === "clinic"
+        ? [{{name:"Consulta inicial",low:50,high:90}},{{name:"Tratamiento estético",low:90,high:250}},{{name:"Consulta dental",low:40,high:100}}]
+        : [{{name:"Diagnóstico en domicilio",low:75,high:150}},{{name:"Reparación estándar",low:150,high:450}},{{name:"Instalación completa",low:450,high:1200}}];
+      const serviceSelect = document.getElementById("estimate-service");
+      services.forEach((service,index) => {{
+        const option = document.createElement("option");
+        option.value = index;
+        option.textContent = service.name;
+        serviceSelect.appendChild(option);
+      }});
+      function updateEstimate() {{
+        const service = services[Number(serviceSelect.value)] || services[0];
+        const count = Math.min(20,Math.max(1,Number(document.getElementById("estimate-units").value)||1));
+        const low = service.low*count;
+        const high = service.high*count;
+        const currency = nicheType === "clinic" ? "EUR" : "USD";
+        document.getElementById("estimate-result").textContent =
+          "Rango estimado: " + new Intl.NumberFormat("es-ES",{{style:"currency",currency}}).format(low) +
+          " – " + new Intl.NumberFormat("es-ES",{{style:"currency",currency}}).format(high) +
+          " · Solicita una evaluación para confirmar.";
+      }}
+      const assistantAnswers = {{
+        price:"Te orientamos según el servicio y tus necesidades. ¿Qué servicio te interesa? Puedo ayudarte a solicitar una cita.",
+        availability:"Podemos revisar horarios contigo. ¿Qué día te viene mejor? Esta demostración no confirma disponibilidad real.",
+        appointment:"¡Claro! Para solicitar una cita, indícanos el servicio y el horario que prefieres. Un especialista confirmará la reserva."
+      }};
+      function updateAssistant() {{
+        document.getElementById("assistant-result").textContent =
+          assistantAnswers[document.getElementById("assistant-question").value];
+      }}
+      serviceSelect.addEventListener("change",updateEstimate);
+      document.getElementById("estimate-units").addEventListener("input",updateEstimate);
+      document.getElementById("assistant-question").addEventListener("change",updateAssistant);
+      updateEstimate();
+      updateAssistant();
+    </script>
     {payment_tracking_script}
   </body>
 </html>"""
@@ -582,12 +848,13 @@ def local_demo_url(record: dict) -> str:
 def proposal_phase_one(record: dict, demo_link: str) -> str:
     return (
         f"Hola, equipo de {record['business_name']}:\n\n"
-        "Notamos que podrían estar perdiendo clientes al no contar con un "
+        f"Analizamos oportunidades de captación para negocios de {record['zone']} "
+        "y notamos que podrían estar perdiendo clientes al no contar con un "
         "cotizador instantáneo disponible 24/7. Preparamos un prototipo "
         "interactivo y personalizado para que lo prueben en vivo:\n"
         f"{demo_link}\n\n"
         "¿Te gustaría que lo conectemos directo al WhatsApp de tu negocio esta semana?"
-        f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}"
+        f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}\n{SUPPORT_EMAIL}"
     )
 
 
@@ -608,7 +875,7 @@ def proposal_phase_two(record: dict, settings: dict) -> str:
         "listo en su dominio en 24 horas, con el flujo de contacto adaptado a su negocio.\n\n"
         "Para comenzar, pueden elegir la opción que mejor les convenga:\n"
         + "\n".join(options)
-        + f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}"
+        + f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}\n{SUPPORT_EMAIL}"
     )
 
 
@@ -998,6 +1265,54 @@ def render_finance_tab(state: dict) -> None:
         money(sum(totals.values())),
         help="Suma de los importes registrados manualmente en este panel.",
     )
+    st.markdown("### Proyecciones de ingresos")
+    projection_columns = st.columns(4)
+    projected_clients = {
+        method: projection_columns[index].slider(
+            f"Ventas/mes · {method} (${amount / 100:.0f})",
+            min_value=0,
+            max_value=50,
+            value=0,
+            key=f"projection_{slugify(method)}",
+        )
+        for index, (method, amount) in enumerate(PAYMENT_OPTIONS.items())
+    }
+    monthly_maintenance = projection_columns[3].slider(
+        "Clientes activos de mantenimiento",
+        min_value=0,
+        max_value=500,
+        value=min(
+            500,
+            len([client for client in state["clients"] if client.get("active", True)]),
+        ),
+        key="projection_maintenance",
+    )
+    projection_by_method = {
+        method: projected_clients[method] * amount
+        for method, amount in PAYMENT_OPTIONS.items()
+    }
+    projected_monthly_cents = (
+        sum(projection_by_method.values()) + monthly_maintenance * 10000
+    )
+    projection_metrics = st.columns(3)
+    projection_metrics[0].metric(
+        "Ingreso semanal estimado", money(round(projected_monthly_cents * 12 / 52))
+    )
+    projection_metrics[1].metric(
+        "Ingreso mensual proyectado", money(projected_monthly_cents)
+    )
+    projection_metrics[2].metric(
+        "Facturación anualizada", money(projected_monthly_cents * 12)
+    )
+    breakdown = st.columns(4)
+    for column, method in zip(breakdown[:3], PAYMENT_OPTIONS):
+        column.metric(
+            f"Proyección · {method}", money(projection_by_method[method])
+        )
+    breakdown[3].metric(
+        "Proyección · mantenimiento",
+        money(monthly_maintenance * 10000),
+    )
     with st.expander("Registrar un ingreso recibido"):
         with st.form("income_form", clear_on_submit=True):
             payment_method = st.selectbox("Método de cobro", list(PAYMENT_OPTIONS))
@@ -1034,6 +1349,238 @@ def render_finance_tab(state: dict) -> None:
                 f"- {item.get('date', '')} · {item['method']} · "
                 f"**{money(item['amount_cents'])}**{reference}"
             )
+
+    st.divider()
+    st.markdown("### Contratos y Notas de Entrega")
+    st.caption(
+        "Los reportes públicos quedan pendientes de verificación. Registra el pago "
+        "solo después de comprobarlo; la Nota de Entrega Oficial se habilita al marcar "
+        "el contrato como entregado y activo."
+    )
+    with st.expander("Registrar una venta verificada manualmente"):
+        with st.form("verified_sale_form", clear_on_submit=True):
+            sale_business = st.text_input("Nombre del negocio")
+            sale_customer = st.text_input("Nombre del cliente")
+            sale_email = st.text_input("Correo del cliente")
+            sale_method = st.selectbox(
+                "Pasarela y precio",
+                list(PAYMENT_OPTIONS),
+                format_func=lambda method: (
+                    f"{method} — ${PAYMENT_OPTIONS[method] / 100:.0f} USD"
+                ),
+                key="sale_payment_method",
+            )
+            sale_reference = st.text_input("Referencia de pago")
+            verified_sale = st.checkbox(
+                "Confirmo que verifiqué el pago fuera de esta aplicación.",
+                value=False,
+            )
+            sale_submitted = st.form_submit_button(
+                "Registrar venta verificada", type="primary"
+            )
+            if sale_submitted:
+                if not verified_sale:
+                    st.error("Confirma la verificación real del pago antes de registrar la venta.")
+                elif not sale_business.strip() or not sale_customer.strip():
+                    st.error("El negocio y el nombre del cliente son obligatorios.")
+                elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", sale_email.strip()):
+                    st.error("Indica un correo válido del cliente.")
+                else:
+                    try:
+                        sale_notification = notificar_compra_ceo(
+                            {
+                                "business_name": sale_business,
+                                "customer_name": sale_customer,
+                                "customer_email": sale_email,
+                                "payment_method": sale_method,
+                                "payment_reference": sale_reference,
+                                "payment_verified": True,
+                            }
+                        )
+                    except (ValueError, OSError) as exc:
+                        st.error(f"No se pudo registrar la venta: {exc}")
+                    else:
+                        state = load_state()
+                        state["income"].append(
+                            {
+                                "id": uuid.uuid4().hex,
+                                "method": sale_method,
+                                "amount_cents": PAYMENT_OPTIONS[sale_method],
+                                "description": (
+                                    f"{sale_business.strip()} · {sale_reference.strip()}"
+                                ).strip(" ·"),
+                                "date": date.today().isoformat(),
+                                "contract_id": sale_notification["contract_id"],
+                            }
+                        )
+                        save_state(state)
+                        st.session_state["flash_message"] = (
+                            f"Venta verificada registrada para {sale_business.strip()}."
+                        )
+                        st.rerun()
+    for contract in state["contracts"]:
+        contract_id = contract.get("id") or uuid.uuid4().hex
+        contract["id"] = contract_id
+        with st.expander(
+            f"{contract.get('business_name', 'Contrato')} · "
+            f"{CONTRACT_STATUSES.get(contract.get('status'), 'Pendiente')}"
+        ):
+            with st.form(f"contract_form_{contract_id}"):
+                contract_col1, contract_col2 = st.columns(2)
+                with contract_col1:
+                    status = st.selectbox(
+                        "Estado del contrato",
+                        list(CONTRACT_STATUSES),
+                        index=(
+                            list(CONTRACT_STATUSES).index(contract["status"])
+                            if contract.get("status") in CONTRACT_STATUSES
+                            else 0
+                        ),
+                        format_func=CONTRACT_STATUSES.get,
+                        key=f"contract_status_{contract_id}",
+                    )
+                    payment_method = st.selectbox(
+                        "Pasarela utilizada",
+                        list(PAYMENT_OPTIONS),
+                        index=(
+                            list(PAYMENT_OPTIONS).index(contract["payment_method"])
+                            if contract.get("payment_method") in PAYMENT_OPTIONS
+                            else 0
+                        ),
+                        key=f"contract_method_{contract_id}",
+                    )
+                    st.metric(
+                        "Monto oficial",
+                        money(PAYMENT_OPTIONS[payment_method]),
+                    )
+                    payment_reference = st.text_input(
+                        "Referencia o ID de pago",
+                        value=contract.get("payment_reference", ""),
+                        key=f"contract_reference_{contract_id}",
+                    )
+                    payment_verified = st.checkbox(
+                        "Pago verificado manualmente",
+                        value=contract.get("payment_verified", False),
+                        key=f"contract_verified_{contract_id}",
+                    )
+                with contract_col2:
+                    delivery_date = st.text_input(
+                        "Fecha de entrega",
+                        value=contract.get("delivery_date", ""),
+                        placeholder="YYYY-MM-DD",
+                        key=f"contract_delivery_date_{contract_id}",
+                    )
+                    warranty = st.text_input(
+                        "Garantía",
+                        value=contract.get(
+                            "warranty",
+                            "30 días de soporte correctivo desde la activación.",
+                        ),
+                        key=f"contract_warranty_{contract_id}",
+                    )
+                    internal_notes = st.text_area(
+                        "Notas internas del CEO",
+                        value=contract.get("internal_notes", ""),
+                        key=f"contract_notes_{contract_id}",
+                    )
+                delivery_details = st.text_area(
+                    "Detalle de la Nota de Entrega para el cliente",
+                    value=contract.get(
+                        "delivery_details",
+                        "Sistema de Captación Web\nCotizador IA\nIntegración WhatsApp",
+                    ),
+                    key=f"contract_delivery_details_{contract_id}",
+                )
+                contract_saved = st.form_submit_button(
+                    "💾 Guardar Control Interno"
+                )
+                if contract_saved:
+                    effective_status = (
+                        "paid_activation"
+                        if payment_verified and status == "pending_verification"
+                        else status
+                    )
+                    if effective_status in ("paid_activation", "delivered_active") and not payment_verified:
+                        st.error(
+                            "Verifica el pago antes de marcarlo como pagado o entregado."
+                        )
+                    elif effective_status == "delivered_active" and not delivery_date.strip():
+                        st.error("Indica la fecha efectiva de entrega.")
+                    elif (
+                        contract.get("payment_verified")
+                        and payment_method != contract.get("payment_method")
+                    ):
+                        st.error(
+                            "La pasarela no se puede cambiar después de verificar el pago."
+                        )
+                    elif delivery_date.strip() and not valid_iso_date(delivery_date.strip()):
+                        st.error("La fecha debe tener formato YYYY-MM-DD.")
+                    else:
+                        was_verified = contract.get("payment_verified", False)
+                        contract.update(
+                            {
+                                "status": effective_status,
+                                "payment_method": payment_method,
+                                "amount_cents": PAYMENT_OPTIONS[payment_method],
+                                "payment_reference": payment_reference.strip(),
+                                "payment_verified": payment_verified,
+                                "delivery_date": delivery_date.strip(),
+                                "warranty": warranty.strip(),
+                                "internal_notes": internal_notes.strip(),
+                                "delivery_details": delivery_details.strip(),
+                            }
+                        )
+                        if payment_verified and not was_verified:
+                            state["income"].append(
+                                {
+                                    "id": uuid.uuid4().hex,
+                                    "method": payment_method,
+                                    "amount_cents": PAYMENT_OPTIONS[payment_method],
+                                    "description": (
+                                        f"{contract.get('business_name')} · "
+                                        f"{payment_reference.strip()}"
+                                    ).strip(" ·"),
+                                    "date": date.today().isoformat(),
+                                    "contract_id": contract_id,
+                                }
+                            )
+                        if payment_verified:
+                            for notification in state["purchase_notifications"]:
+                                if notification.get("contract_id") == contract_id:
+                                    notification["status"] = "verified"
+                                    notification["verified_at"] = (
+                                        datetime.now()
+                                        .astimezone()
+                                        .isoformat(timespec="seconds")
+                                    )
+                        save_state(state)
+                        st.session_state["flash_message"] = (
+                            f"Control interno guardado para {contract.get('business_name')}."
+                        )
+                        st.rerun()
+            if (
+                contract.get("status") != "delivered_active"
+                or not contract.get("payment_verified")
+            ):
+                st.info(
+                    "La Nota de Entrega Oficial se habilitará cuando el pago esté "
+                    "verificado y el contrato figure como «Entregado y activo»."
+                )
+            if st.button(
+                "📧 Generar y Enviar Nota de Entrega Oficial al Cliente",
+                key=f"send_delivery_note_{contract_id}",
+                disabled=(
+                    contract.get("status") != "delivered_active"
+                    or not contract.get("payment_verified")
+                ),
+                use_container_width=True,
+            ):
+                enqueue_background_job(
+                    f"Nota de entrega: {contract.get('business_name')}",
+                    enviar_nota_entrega_cliente,
+                    dict(contract),
+                )
+                st.success("El envío de la Nota de Entrega quedó en cola.")
 
     st.divider()
     active_clients = [client for client in state["clients"] if client.get("active", True)]
@@ -1085,6 +1632,7 @@ def render_sidebar_settings(state: dict) -> None:
         st.markdown("# 🎛️ CEO")
         st.markdown(f"### {AGENCY_NAME}")
         st.caption("Operaciones locales · Aprobación humana")
+        st.caption(f"Correo oficial de soporte: {support_email_visual()}")
         with st.form("agency_settings_form"):
             prototype_base_url = st.text_input(
                 "URL pública autorizada para demos",
@@ -1222,6 +1770,37 @@ def render_background_jobs() -> None:
         st.rerun()
 
 
+def render_recent_purchase_notifications(state: dict) -> None:
+    st.markdown("### 🔔 Notificaciones de Compras Recientes")
+    recent = state["purchase_notifications"][:8]
+    if not recent:
+        st.caption("Todavía no hay reportes de pago o compras registradas.")
+        return
+    for notification in recent:
+        verified = notification.get("status") == "verified"
+        status_text = "Pago verificado manualmente" if verified else "Pendiente de verificación"
+        with st.container(border=True):
+            left, right = st.columns([3, 1])
+            with left:
+                st.markdown(
+                    f"**{notification.get('business_name', 'Negocio')}** · "
+                    f"{notification.get('customer_name', 'Cliente')}"
+                )
+                st.caption(
+                    f"{notification.get('created_at', '')} · "
+                    f"{notification.get('payment_method', '')} · "
+                    f"{money(notification.get('amount_cents', 0))} · "
+                    f"{notification.get('customer_email', '')}"
+                )
+                if notification.get("payment_reference"):
+                    st.caption(f"Referencia: {notification['payment_reference']}")
+            with right:
+                if verified:
+                    st.success(status_text)
+                else:
+                    st.warning(status_text)
+
+
 def find_demo_record(state: dict, demo_query: str) -> dict | None:
     normalized = demo_query.strip().casefold()
     exact_matches = [
@@ -1272,8 +1851,90 @@ def render_demo_view(
             payment_options_open=payment_options_open,
             track_payment_open=not payment_options_open,
         ),
-        height=1100,
+        height=1550,
     )
+    st.subheader("✅ Ya realicé el pago / Activar mi sistema ahora")
+    st.caption(
+        "Este formulario registra tu reporte para que el equipo verifique la referencia. "
+        "No procesa pagos ni confirma automáticamente una transacción."
+    )
+    payment_labels = {
+        method: f"{method} — ${amount / 100:.0f} USD"
+        for method, amount in PAYMENT_OPTIONS.items()
+    }
+    with st.form(f"purchase_report_{record['id']}", clear_on_submit=True):
+        customer_name = st.text_input("Nombre")
+        customer_email = st.text_input("Correo electrónico")
+        payment_method = st.selectbox(
+            "Pasarela utilizada", list(PAYMENT_OPTIONS), format_func=payment_labels.get
+        )
+        payment_reference = st.text_input("Número de referencia de pago")
+        customer_notes = st.text_area("Notas adicionales (opcional)")
+        request_delivery_note = st.checkbox(
+            "Solicito recibir mi Nota de Entrega oficial automáticamente en mi correo",
+            value=True,
+        )
+        submitted = st.form_submit_button(
+            "Enviar reporte de pago y solicitar activación", type="primary"
+        )
+        if submitted:
+            if not customer_name.strip():
+                st.error("Indica tu nombre.")
+            elif not re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+", customer_email.strip()
+            ):
+                st.error("Indica una dirección de correo válida.")
+            elif not payment_reference.strip():
+                st.error("Indica la referencia del pago para que podamos verificarla.")
+            else:
+                try:
+                    notification = notificar_compra_ceo(
+                        {
+                            "business_name": record["business_name"],
+                            "customer_name": customer_name,
+                            "customer_email": customer_email,
+                            "payment_method": payment_method,
+                            "payment_reference": payment_reference,
+                            "notes": customer_notes,
+                            "delivery_note_requested": request_delivery_note,
+                            "prototype_id": record["id"],
+                        }
+                    )
+                except (ValueError, OSError) as exc:
+                    st.error(f"No se pudo registrar la solicitud: {exc}")
+                else:
+                    st.session_state[f"purchase_confirmation_{record['id']}"] = (
+                        notification["id"]
+                    )
+                    st.rerun()
+    if st.session_state.get(f"purchase_confirmation_{record['id']}"):
+        st.success(
+            "Recibimos tu solicitud. Verificaremos el pago y te contactaremos; "
+            "la activación se coordina después de esa verificación. La Nota de Entrega "
+            "oficial se enviará cuando el sistema esté entregado y activo."
+        )
+
+    st.subheader("Preguntas frecuentes")
+    for question, answer in (
+        (
+            "¿Cuánto tiempo toma dejarlo instalado en mi negocio?",
+            "La activación se coordina en un plazo estimado de 24 horas tras confirmar el pago y los accesos necesarios.",
+        ),
+        (
+            "¿Funciona con mi número actual de WhatsApp y mi dominio?",
+            "Sí. Se puede configurar para integrarse con tu número y dominio actuales; la configuración final se confirma al activar el proyecto.",
+        ),
+        (
+            "¿Puedo solicitar Nota de Entrega o comprobante corporativo?",
+            "Sí. Puedes solicitar la Nota de Entrega aquí; se envía automáticamente después de verificar el pago y registrar la entrega.",
+        ),
+        (
+            "¿Dónde recibo soporte técnico directo?",
+            f"Atención prioritaria en {SUPPORT_EMAIL}.",
+        ),
+    ):
+        with st.expander(question):
+            st.write(answer)
 
 
 def require_ceo_login() -> bool:
@@ -1373,6 +2034,7 @@ def main() -> None:
     flash = st.session_state.pop("flash_message", None)
     if flash:
         st.success(flash)
+    render_recent_purchase_notifications(state)
 
     factory_tab, approval_tab, finance_tab = st.tabs(
         [
