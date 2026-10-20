@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import html
+import hmac
 import json
 import re
 import shutil
+import smtplib
+import ssl
+import threading
 import time
 import uuid
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime
+from email.message import EmailMessage
+from email.utils import parseaddr
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
+import requests
 import streamlit as st
 
 
@@ -18,6 +27,26 @@ PENDING_DIR = ROOT / "02_BANDEJA_APROBACION" / "pendientes"
 APPROVED_DIR = ROOT / "02_BANDEJA_APROBACION" / "aprobados"
 DATA_DIR = ROOT / ".ceo_dashboard"
 STATE_FILE = DATA_DIR / "state.json"
+
+
+@st.cache_resource
+def get_state_lock():
+    return threading.RLock()
+
+
+@st.cache_resource
+def get_background_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="ceo-outbound")
+
+
+@st.cache_resource
+def get_background_jobs() -> tuple[dict[str, dict], threading.Lock]:
+    return {}, threading.Lock()
+
+
+STATE_LOCK = get_state_lock()
+BACKGROUND_EXECUTOR = get_background_executor()
+BACKGROUND_JOBS, BACKGROUND_JOBS_LOCK = get_background_jobs()
 
 NICHES = {
     "Contratistas de Servicios del Hogar (Miami, EE. UU.)": {
@@ -60,7 +89,9 @@ PAYMENT_OPTIONS = {
 STATUS_LABELS = {
     "pending": "Pendiente de aprobación",
     "changes_requested": "Ajustes solicitados",
-    "approved": "Aprobado; envío simulado",
+    "sending": "Envío de correo en curso",
+    "approved": "Correo enviado y aprobado",
+    "sent_archive_failed": "Correo enviado; archivo pendiente",
 }
 
 
@@ -78,6 +109,11 @@ def default_state() -> dict:
 
 
 def load_state() -> dict:
+    with STATE_LOCK:
+        return _load_state()
+
+
+def _load_state() -> dict:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     APPROVED_DIR.mkdir(parents=True, exist_ok=True)
@@ -109,6 +145,11 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    with STATE_LOCK:
+        _save_state(state)
+
+
+def _save_state(state: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     temporary_file = STATE_FILE.with_suffix(".tmp")
     temporary_file.write_text(
@@ -117,12 +158,126 @@ def save_state(state: dict) -> None:
     temporary_file.replace(STATE_FILE)
 
 
+def required_secret(name: str) -> str:
+    try:
+        value = str(st.secrets[name]).strip()
+    except (KeyError, FileNotFoundError) as exc:
+        raise RuntimeError(
+            f"Falta configurar el secreto {name} en Streamlit secrets."
+        ) from exc
+    if not value:
+        raise RuntimeError(f"El secreto {name} está vacío.")
+    return value
+
+
+def notificar_ceo_whatsapp(mensaje: str) -> None:
+    api_id = required_secret("GREEN_API_ID")
+    api_token = required_secret("GREEN_API_TOKEN")
+    chat_id = required_secret("CEO_WHATSAPP")
+    if not re.fullmatch(r"\d+@c\.us", chat_id):
+        raise RuntimeError(
+            "CEO_WHATSAPP debe ser el chatId personal con formato numérico y sufijo @c.us."
+        )
+    endpoint = f"https://api.green-api.com/waInstance{api_id}/sendMessage/{api_token}"
+    try:
+        response = requests.post(
+            endpoint,
+            json={"chatId": chat_id, "message": mensaje},
+            timeout=(5, 15),
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Falló la conexión con Green-API ({type(exc).__name__})."
+        ) from None
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(
+            f"Green-API rechazó la notificación (HTTP {response.status_code})."
+        )
+
+
+def enviar_correo_cliente(destinatario: str, asunto: str, cuerpo: str) -> None:
+    sender = required_secret("SMTP_EMAIL")
+    password = required_secret("SMTP_PASSWORD")
+    parsed_sender = parseaddr(sender)[1]
+    parsed_recipient = parseaddr(destinatario)[1]
+    if (
+        not parsed_sender
+        or parsed_sender != sender
+        or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", parsed_sender)
+    ):
+        raise ValueError("SMTP_EMAIL debe contener una dirección de correo válida.")
+    if (
+        not parsed_recipient
+        or parsed_recipient != destinatario.strip()
+        or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", parsed_recipient)
+    ):
+        raise ValueError("Indica un correo válido para el prospecto antes de aprobar.")
+    if "\r" in asunto or "\n" in asunto:
+        raise ValueError("El asunto del correo no puede contener saltos de línea.")
+
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = parsed_recipient
+    message["Subject"] = asunto
+    message.set_content(cuerpo)
+    try:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com", 465, timeout=20, context=ssl.create_default_context()
+        ) as smtp:
+            smtp.login(sender, password)
+            refused = smtp.send_message(message)
+    except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+        raise RuntimeError(
+            f"No se pudo enviar el correo por SMTP ({type(exc).__name__})."
+        ) from None
+    if refused:
+        raise RuntimeError("El servidor SMTP rechazó el destinatario.")
+
+
+def enqueue_background_job(
+    label: str,
+    function: Callable[..., object],
+    *args,
+    kind: str = "notification",
+    record_id: str = "",
+) -> str:
+    job_id = uuid.uuid4().hex
+    future = BACKGROUND_EXECUTOR.submit(function, *args)
+    with BACKGROUND_JOBS_LOCK:
+        BACKGROUND_JOBS[job_id] = {
+            "id": job_id,
+            "label": label,
+            "kind": kind,
+            "record_id": record_id,
+            "future": future,
+            "status": "queued",
+            "error": "",
+        }
+        completed_ids = [
+            old_id
+            for old_id, job in BACKGROUND_JOBS.items()
+            if job["status"] in ("succeeded", "failed")
+        ]
+        for old_id in completed_ids[:-100]:
+            del BACKGROUND_JOBS[old_id]
+    return job_id
+
+
 def money(cents: int) -> str:
     return f"${cents / 100:,.2f} USD"
 
 
 def safe_text(value: str) -> str:
     return html.escape(value.strip(), quote=True)
+
+
+def ceo_whatsapp_digits() -> str:
+    try:
+        chat_id = str(st.secrets["CEO_WHATSAPP"]).strip()
+    except (KeyError, FileNotFoundError):
+        return ""
+    match = re.fullmatch(r"(\d+)@c\.us", chat_id)
+    return match.group(1) if match else ""
 
 
 def slugify(value: str) -> str:
@@ -143,6 +298,9 @@ def make_prototype_html(
     service: str,
     zone: str,
     payment_links: dict | None = None,
+    whatsapp_number: str = "",
+    payment_options_open: bool = False,
+    track_payment_open: bool = False,
 ) -> str:
     business = safe_text(name)
     category = safe_text(service)
@@ -165,6 +323,30 @@ def make_prototype_html(
                 f'${cents / 100:.0f} USD <small>Enlace pendiente de configurar</small></span>'
             )
     payment_options = "\n".join(payment_rows)
+    phone_digits = re.sub(r"\D", "", whatsapp_number)
+    whatsapp_button = ""
+    if phone_digits:
+        whatsapp_message = quote(
+            "Hola, acabo de ver el prototipo de mi negocio y quiero activarlo"
+        )
+        whatsapp_button = (
+            f'<a class="whatsapp-float" href="https://wa.me/{phone_digits}?text={whatsapp_message}" '
+            'target="_blank" rel="noopener noreferrer">💬 Hablar con un especialista por WhatsApp para activar</a>'
+        )
+    payment_tracking_script = ""
+    if track_payment_open:
+        event_query = json.dumps(
+            {"demo": name, "payments_opened": "1"}, ensure_ascii=True
+        ).replace("<", "\\u003c")
+        payment_tracking_script = f"""<script>
+          document.querySelector(".payment-menu")?.addEventListener("toggle", function () {{
+            if (this.open && window.top !== window) {{
+              const query = new URLSearchParams({event_query});
+              window.top.location.assign(window.top.location.pathname + "?" + query.toString());
+            }}
+          }});
+        </script>"""
+    details_open = " open" if payment_options_open else ""
     return f"""<!doctype html>
 <html lang="es">
   <head>
@@ -188,13 +370,15 @@ def make_prototype_html(
       .payment-link{{display:block;border-radius:.7rem;background:#f5f5f4;padding:.75rem;color:#14532d;font-size:.88rem;font-weight:700;text-decoration:none}}
       .payment-link:hover{{background:#e7f2e9}}
       .payment-link small{{display:block;margin-top:.2rem;color:#78716c;font-weight:400}}
+      .whatsapp-float{{position:fixed;right:1.25rem;bottom:1.25rem;z-index:40;max-width:calc(100vw - 2.5rem);border-radius:999px;background:#15803d;padding:.9rem 1.2rem;color:white;font-size:.85rem;font-weight:700;text-align:center;text-decoration:none;box-shadow:0 8px 24px #0003}}
+      .whatsapp-float:hover{{background:#166534}}
       @media(max-width:520px){{.preview-toolbar{{align-items:flex-start;flex-direction:column}}body{{padding-top:116px}}.payment-list{{left:0;right:auto}}}}
     </style>
   </head>
   <body class="bg-stone-50 text-stone-900 antialiased">
     <aside class="preview-toolbar">
       <p>Vista previa exclusiva creada para {business} — Lista para activar</p>
-      <details class="payment-menu">
+      <details class="payment-menu"{details_open}>
         <summary>🚀 Activar en mi dominio hoy</summary>
         <div class="payment-list" aria-label="Opciones de pago">
           {payment_options}
@@ -239,6 +423,8 @@ def make_prototype_html(
       </section>
     </main>
     <footer class="border-t border-stone-200 px-6 py-6 text-center text-xs text-stone-500">© 2026 {business} · Concepto de demostración sin conexión de reservas.</footer>
+    {whatsapp_button}
+    {payment_tracking_script}
   </body>
 </html>"""
 
@@ -257,7 +443,11 @@ def create_prototypes(
         folder = PENDING_DIR / unique_id
         folder.mkdir(parents=False, exist_ok=False)
         html_content = make_prototype_html(
-            name, service, NICHES[niche]["zone"], payment_links
+            name,
+            service,
+            NICHES[niche]["zone"],
+            payment_links,
+            ceo_whatsapp_digits(),
         )
         (folder / "index.html").write_text(html_content, encoding="utf-8")
         record = {
@@ -287,18 +477,69 @@ def safe_prototype_folder(record: dict, expected_parent: Path) -> Path:
 
 
 def approve_prototype(state: dict, record: dict) -> None:
-    source = safe_prototype_folder(record, PENDING_DIR)
-    destination = APPROVED_DIR / source.name
-    if destination.exists():
-        raise FileExistsError(f"Ya existe el destino de aprobación: {destination.name}")
-    shutil.move(str(source), str(destination))
-    record["status"] = "approved"
-    record["approved_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-    record["folder"] = str(destination.relative_to(ROOT))
-    (destination / "proposal.json").write_text(
-        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+    with STATE_LOCK:
+        source = safe_prototype_folder(record, PENDING_DIR)
+        destination = APPROVED_DIR / source.name
+        if destination.exists():
+            raise FileExistsError(f"Ya existe el destino de aprobación: {destination.name}")
+        shutil.move(str(source), str(destination))
+        record["status"] = "approved"
+        record["approved_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        record["folder"] = str(destination.relative_to(ROOT))
+        (destination / "proposal.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        save_state(state)
+
+
+class EmailSentArchiveError(RuntimeError):
+    pass
+
+
+def dispatch_approved_proposal(
+    record_id: str, recipient: str, subject: str, body: str
+) -> str:
+    enviar_correo_cliente(recipient, subject, body)
+    try:
+        with STATE_LOCK:
+            state = load_state()
+            record = next(
+                item for item in state["prototypes"] if item.get("id") == record_id
+            )
+            if record.get("status") != "sending":
+                raise ValueError("El estado de aprobación cambió durante el envío.")
+            business_name = record["business_name"]
+            approve_prototype(state, record)
+    except (OSError, ValueError, KeyError, StopIteration) as exc:
+        try:
+            with STATE_LOCK:
+                state = load_state()
+                record = next(
+                    item
+                    for item in state["prototypes"]
+                    if item.get("id") == record_id
+                )
+                record["status"] = "sent_archive_failed"
+                record["last_send_error"] = (
+                    "Correo enviado, pero falló el archivado. No reenvíes sin revisar."
+                )
+                save_state(state)
+        except (OSError, ValueError, KeyError, StopIteration) as recovery_error:
+            raise EmailSentArchiveError(
+                "El correo se envió, pero fallaron el archivado y la actualización "
+                "del estado. Revisa los archivos antes de reenviar."
+            ) from recovery_error
+        raise EmailSentArchiveError(
+            "El correo se envió, pero no se pudo archivar la propuesta. "
+            "No vuelvas a enviarla sin revisar el estado."
+        ) from exc
+
+    enqueue_background_job(
+        f"Notificación de propuesta enviada a {business_name}",
+        notificar_ceo_whatsapp,
+        f"✅ Propuesta enviada automáticamente a {business_name}",
     )
-    save_state(state)
+    return f"Correo enviado automáticamente a {business_name}."
 
 
 def register_change_request(state: dict, record: dict, note: str) -> None:
@@ -314,7 +555,7 @@ def register_change_request(state: dict, record: dict, note: str) -> None:
 
 def public_demo_url(record: dict, settings: dict) -> str:
     base_url = valid_web_url(settings.get("prototype_base_url", ""))
-    if not base_url:
+    if not base_url or urlparse(base_url).scheme != "https":
         return ""
     parsed = urlparse(base_url)
     if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
@@ -322,14 +563,14 @@ def public_demo_url(record: dict, settings: dict) -> str:
     return urlunparse(
         parsed._replace(
             path=parsed.path or "/",
-            query=urlencode({"demo": record["id"]}),
+            query=urlencode({"demo": record["business_name"]}),
             fragment="",
         )
     )
 
 
 def local_demo_url(record: dict) -> str:
-    return f"http://127.0.0.1:8501/?{urlencode({'demo': record['id']})}"
+    return f"http://127.0.0.1:8501/?{urlencode({'demo': record['business_name']})}"
 
 
 def proposal_phase_one(record: dict, demo_link: str) -> str:
@@ -392,6 +633,7 @@ def show_prototype_preview(
         record["service"],
         record["zone"],
         settings.get("payment_links", {}),
+        ceo_whatsapp_digits(),
     )
     share_url = public_demo_url(record, settings)
     col_preview, col_open, col_download = st.columns([1, 1, 1])
@@ -476,8 +718,13 @@ def render_factory_tab(state: dict) -> None:
                 label=f"Listo: {len(created)} prototipo(s) local(es) creados",
                 state="complete",
             )
+        enqueue_background_job(
+            "Notificación del lote de prototipos",
+            notificar_ceo_whatsapp,
+            f"🏭 Agentes terminaron {len(created)} prototipos. Entra a tu app para aprobarlos",
+        )
         st.success(
-            f"{len(created)} prototipo(s) listo(s) para revisar en la pestaña de aprobación."
+            f"{len(created)} prototipo(s) listo(s). La notificación al CEO quedó en cola."
         )
         st.rerun()
 
@@ -499,8 +746,8 @@ def render_factory_tab(state: dict) -> None:
 def render_approval_tab(state: dict) -> None:
     st.subheader("Bandeja de aprobación del CEO")
     st.warning(
-        "Human-in-the-Loop: aprobar simula el envío y archiva el prototipo; "
-        "no se envía ningún correo real ni se publica en producción."
+        "Human-in-the-Loop: el clic de aprobación envía por SMTP el correo de Fase 1 "
+        "al prospecto y archiva la propuesta. Verifica el destinatario y el prototipo antes de aprobar."
     )
     pending = [
         record
@@ -509,6 +756,16 @@ def render_approval_tab(state: dict) -> None:
     ]
     if not pending:
         st.success("No hay propuestas pendientes. Lanza una operación para generar prototipos.")
+    archive_attention = [
+        record
+        for record in state["prototypes"]
+        if record.get("status") == "sent_archive_failed"
+    ]
+    for record in archive_attention:
+        st.error(
+            f"{record['business_name']}: el correo fue enviado, pero el archivado "
+            "requiere revisión manual. No vuelvas a despacharlo."
+        )
     for record in pending:
         key = record["id"]
         with st.container(border=True):
@@ -523,25 +780,23 @@ def render_approval_tab(state: dict) -> None:
             if record.get("note"):
                 st.info(f"Nota de ajustes: {record['note']}")
             show_prototype_preview(record, key, state["settings"])
-            with st.form(f"contact_form_{key}"):
-                email_col, phone_col, save_col = st.columns([2, 2, 1])
-                with email_col:
-                    recipient_email = st.text_input(
-                        "Correo del prospecto",
-                        value=record.get("contact_email", ""),
-                        key=f"email_{key}",
-                    )
-                with phone_col:
-                    recipient_phone = st.text_input(
-                        "WhatsApp del prospecto (opcional)",
-                        value=record.get("contact_whatsapp", ""),
-                        key=f"phone_{key}",
-                        placeholder="+1 305 555 0100",
-                    )
-                with save_col:
-                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-                    save_contact = st.form_submit_button("Guardar contacto")
-                if save_contact:
+            email_col, phone_col, save_col = st.columns([2, 2, 1])
+            with email_col:
+                recipient_email = st.text_input(
+                    "Correo del prospecto",
+                    value=record.get("contact_email", ""),
+                    key=f"email_{key}",
+                )
+            with phone_col:
+                recipient_phone = st.text_input(
+                    "WhatsApp del prospecto (opcional)",
+                    value=record.get("contact_whatsapp", ""),
+                    key=f"phone_{key}",
+                    placeholder="+1 305 555 0100",
+                )
+            with save_col:
+                st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                if st.button("Guardar contacto", key=f"save_contact_{key}"):
                     record["contact_email"] = recipient_email.strip()
                     record["contact_whatsapp"] = recipient_phone.strip()
                     save_state(state)
@@ -630,24 +885,44 @@ def render_approval_tab(state: dict) -> None:
                         "Los botones abren un borrador en tu aplicación; revisa el contenido "
                         "y envíalo manualmente. No se envían mensajes desde el dashboard."
                     )
+            if record.get("last_send_error"):
+                st.error(f"Último intento: {record['last_send_error']}")
             approve_col, reject_col = st.columns(2)
             with approve_col:
                 if st.button(
-                    "✅ Aprobar y Enviar Propuesta",
+                    "✅ Aprobar y Despachar Automáticamente",
                     key=f"approve_{key}",
                     type="primary",
                     use_container_width=True,
                 ):
-                    try:
-                        approve_prototype(state, record)
-                    except (OSError, ValueError, KeyError) as exc:
-                        st.error(f"No se pudo aprobar esta propuesta: {exc}")
-                    else:
-                        st.session_state["flash_message"] = (
-                            f"{record['business_name']}: prototipo archivado; envío simulado, "
-                            "sin correo real."
+                    if not re.fullmatch(
+                        r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient_email.strip()
+                    ):
+                        st.error("Introduce un correo válido antes de aprobar.")
+                    elif not share_url:
+                        st.error(
+                            "Configura y autoriza una URL pública para la demo antes de enviar."
                         )
-                        st.rerun()
+                    else:
+                        record["contact_email"] = recipient_email.strip()
+                        record["contact_whatsapp"] = recipient_phone.strip()
+                        record["status"] = "sending"
+                        record.pop("last_send_error", None)
+                        save_state(state)
+                        enqueue_background_job(
+                            f"Envío de propuesta a {record['business_name']}",
+                            dispatch_approved_proposal,
+                            record["id"],
+                            record["contact_email"],
+                            f"Una idea para {record['business_name']}",
+                            proposal_phase_one(record, share_url),
+                            kind="approval",
+                            record_id=record["id"],
+                        )
+                        st.success(
+                            f"Correo encolado para {record['business_name']}; "
+                            "se enviará en segundo plano."
+                        )
             with reject_col:
                 with st.form(f"reject_form_{key}"):
                     note = st.text_input(
@@ -837,11 +1112,15 @@ def render_sidebar_settings(state: dict) -> None:
                         ("URL pública de demos", prototype_base_url),
                         *payment_links.items(),
                     ]
-                    if url.strip() and not valid_web_url(url)
+                    if url.strip()
+                    and (
+                        not valid_web_url(url)
+                        or urlparse(url).scheme != "https"
+                    )
                 ]
                 if invalid_urls:
                     st.error(
-                        "Usa URLs completas que empiecen por http:// o https://: "
+                        "Usa URLs HTTPS completas para la demo y los enlaces de pago: "
                         + ", ".join(invalid_urls)
                     )
                 else:
@@ -862,14 +1141,101 @@ def render_sidebar_settings(state: dict) -> None:
         st.divider()
         st.markdown("**Estado de la fábrica**")
         pending_count = sum(
-            record.get("status") in ("pending", "changes_requested")
+            record.get("status") in ("pending", "changes_requested", "sending")
             for record in state["prototypes"]
         )
         st.metric("Propuestas por revisar", pending_count)
-        st.caption("Los botones abren borradores; no se envían mensajes ni pagos.")
+        st.caption(
+            "Los mensajes salen solo tras acciones explícitas; los pagos no se procesan aquí."
+        )
+        if st.button(
+            "🔔 Probar Notificación a mi WhatsApp",
+            use_container_width=True,
+        ):
+            enqueue_background_job(
+                "Prueba de notificación Green-API",
+                notificar_ceo_whatsapp,
+                "🔔 Prueba de conexión del CEO Command Center: Green-API está configurada.",
+            )
+            st.success("Prueba enviada a la cola; revisa el estado abajo.")
 
 
-def render_demo_view(record: dict, state: dict) -> None:
+@st.fragment(run_every="2s")
+def render_background_jobs() -> None:
+    with BACKGROUND_JOBS_LOCK:
+        jobs = list(BACKGROUND_JOBS.values())
+    refresh_app = False
+    for job in jobs:
+        future: Future = job["future"]
+        if job["status"] in ("queued", "running") and future.done():
+            try:
+                result = future.result()
+            except EmailSentArchiveError as exc:
+                job["status"] = "failed"
+                job["error"] = str(exc)
+                refresh_app = True
+            except (RuntimeError, ValueError, OSError, KeyError) as exc:
+                job["status"] = "failed"
+                job["error"] = str(exc)
+                if job["kind"] == "approval":
+                    with STATE_LOCK:
+                        state = load_state()
+                        record = next(
+                            (
+                                item
+                                for item in state["prototypes"]
+                                if item.get("id") == job["record_id"]
+                            ),
+                            None,
+                        )
+                        if record and record.get("status") == "sending":
+                            record["status"] = "pending"
+                            record["last_send_error"] = str(exc)
+                            save_state(state)
+                    refresh_app = True
+            else:
+                job["status"] = "succeeded"
+                job["result"] = str(result or "Tarea completada.")
+                refresh_app = refresh_app or job["kind"] == "approval"
+        elif job["status"] == "queued" and future.running():
+            job["status"] = "running"
+
+    with BACKGROUND_JOBS_LOCK:
+        visible_jobs = list(BACKGROUND_JOBS.values())[-10:]
+    if visible_jobs:
+        st.markdown("#### Actividades en segundo plano")
+        for job in reversed(visible_jobs):
+            if job["status"] in ("queued", "running"):
+                st.info(f"⏳ {job['label']}: procesando…")
+            elif job["status"] == "succeeded":
+                st.success(f"{job['label']}: {job.get('result', 'Completado.')}")
+            else:
+                st.error(f"{job['label']}: {job['error']}")
+    if refresh_app:
+        st.rerun()
+
+
+def find_demo_record(state: dict, demo_query: str) -> dict | None:
+    normalized = demo_query.strip().casefold()
+    exact_matches = [
+        record
+        for record in state["prototypes"]
+        if record.get("id") == demo_query
+        or record.get("business_name", "").casefold() == normalized
+    ]
+    if exact_matches:
+        return exact_matches[0] if len(exact_matches) == 1 else None
+    slug_matches = [
+        record
+        for record in state["prototypes"]
+        if slugify(record.get("business_name", "")) == slugify(demo_query)
+    ]
+    return slug_matches[0] if len(slug_matches) == 1 else None
+
+
+def render_demo_view(
+    record: dict, state: dict, payment_options_open: bool = False
+) -> None:
     st.markdown(
         """
         <style>
@@ -880,6 +1246,11 @@ def render_demo_view(record: dict, state: dict) -> None:
         unsafe_allow_html=True,
     )
     st.title(f"Vista previa exclusiva para {record['business_name']}")
+    if not ceo_whatsapp_digits():
+        st.warning(
+            "El contacto de WhatsApp del especialista no está disponible; "
+            "configura CEO_WHATSAPP en Streamlit secrets."
+        )
     st.caption(
         "Concepto de demostración. La activación requiere aprobación explícita, "
         "configuración de enlaces y publicación autorizada."
@@ -890,9 +1261,36 @@ def render_demo_view(record: dict, state: dict) -> None:
             record["service"],
             record["zone"],
             state["settings"].get("payment_links", {}),
+            ceo_whatsapp_digits(),
+            payment_options_open=payment_options_open,
+            track_payment_open=not payment_options_open,
         ),
         height=1100,
     )
+
+
+def require_ceo_login() -> bool:
+    if st.session_state.get("ceo_authenticated", False):
+        return True
+    try:
+        expected_password = required_secret("CEO_DASHBOARD_PASSWORD")
+    except RuntimeError as exc:
+        st.error(
+            f"{exc} El panel administrativo no se habilita sin contraseña, "
+            "para proteger datos financieros y operaciones al compartir demos."
+        )
+        return False
+    st.title("Acceso CEO")
+    st.caption("Inicia sesión para abrir el panel administrativo.")
+    with st.form("ceo_login_form"):
+        password = st.text_input("Contraseña del CEO", type="password")
+        submitted = st.form_submit_button("Entrar", type="primary")
+    if submitted:
+        if hmac.compare_digest(password, expected_password):
+            st.session_state["ceo_authenticated"] = True
+            st.rerun()
+        st.error("Contraseña incorrecta.")
+    return False
 
 
 def main() -> None:
@@ -934,18 +1332,32 @@ def main() -> None:
 
     demo_id = st.query_params.get("demo")
     if demo_id:
-        demo_record = next(
-            (
-                record
-                for record in state["prototypes"]
-                if record.get("id") == demo_id
-            ),
-            None,
-        )
+        payments_opened = st.query_params.get("payments_opened") == "1"
+        demo_record = find_demo_record(state, demo_id)
         if demo_record is None:
             st.error("No se encontró una demo con ese identificador.")
             st.stop()
-        render_demo_view(demo_record, state)
+        if (
+            not payments_opened
+            and st.session_state.get("notified_demo_open") != demo_record["id"]
+        ):
+            st.session_state["notified_demo_open"] = demo_record["id"]
+            enqueue_background_job(
+                f"Alerta de apertura de demo: {demo_record['business_name']}",
+                notificar_ceo_whatsapp,
+                f"👀 ¡Alerta CEO! El negocio {demo_record['business_name']} acaba de abrir su prototipo en vivo",
+            )
+        if payments_opened and st.session_state.get("notified_payments_open") != demo_record["id"]:
+            st.session_state["notified_payments_open"] = demo_record["id"]
+            enqueue_background_job(
+                f"Opciones de pago abiertas: {demo_record['business_name']}",
+                notificar_ceo_whatsapp,
+                f"💳 ¡Alerta CEO! El negocio {demo_record['business_name']} desplegó las opciones de pago de su prototipo",
+            )
+        render_demo_view(demo_record, state, payments_opened)
+        st.stop()
+
+    if not require_ceo_login():
         st.stop()
 
     render_sidebar_settings(state)
@@ -968,6 +1380,7 @@ def main() -> None:
         render_approval_tab(state)
     with finance_tab:
         render_finance_tab(state)
+    render_background_jobs()
 
 
 if __name__ == "__main__":
