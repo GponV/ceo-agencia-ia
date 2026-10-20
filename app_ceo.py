@@ -8,9 +8,9 @@ import time
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 ROOT = Path(__file__).resolve().parent
@@ -57,14 +57,6 @@ PAYMENT_OPTIONS = {
     "Payoneer (Tarjeta/ACH)": 40000,
     "PayPal": 42500,
 }
-PAYMENT_COPY = (
-    "1. Binance Pay / USDT — $380 USD (5% de descuento)\n"
-    "   Enlace oficial: pendiente de configurar.\n"
-    "2. Payoneer (Tarjeta/ACH) — $400 USD\n"
-    "   Enlace oficial: pendiente de configurar.\n"
-    "3. PayPal — $425 USD\n"
-    "   Enlace oficial: pendiente de configurar."
-)
 STATUS_LABELS = {
     "pending": "Pendiente de aprobación",
     "changes_requested": "Ajustes solicitados",
@@ -73,7 +65,16 @@ STATUS_LABELS = {
 
 
 def default_state() -> dict:
-    return {"prototypes": [], "income": [], "clients": []}
+    return {
+        "prototypes": [],
+        "income": [],
+        "clients": [],
+        "settings": {
+            "agency_name": "Mi agencia",
+            "prototype_base_url": "",
+            "payment_links": {method: "" for method in PAYMENT_OPTIONS},
+        },
+    }
 
 
 def load_state() -> dict:
@@ -94,6 +95,16 @@ def load_state() -> dict:
         raise ValueError(
             f"El archivo {STATE_FILE.relative_to(ROOT)} no tiene el formato esperado."
         )
+    defaults = default_state()
+    settings = state.setdefault("settings", defaults["settings"])
+    if not isinstance(settings, dict):
+        raise ValueError("La configuración guardada no tiene el formato esperado.")
+    for key, value in defaults["settings"].items():
+        settings.setdefault(key, value)
+    if not isinstance(settings["payment_links"], dict):
+        raise ValueError("Los enlaces de pago guardados no tienen el formato esperado.")
+    for method in PAYMENT_OPTIONS:
+        settings["payment_links"].setdefault(method, "")
     return state
 
 
@@ -119,10 +130,41 @@ def slugify(value: str) -> str:
     return normalized or "prototipo"
 
 
-def make_prototype_html(name: str, service: str, zone: str) -> str:
+def valid_web_url(value: str) -> str:
+    candidate = value.strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return candidate
+
+
+def make_prototype_html(
+    name: str,
+    service: str,
+    zone: str,
+    payment_links: dict | None = None,
+) -> str:
     business = safe_text(name)
     category = safe_text(service)
     location = safe_text(zone)
+    payment_links = payment_links or {}
+    payment_rows = []
+    for method, cents in PAYMENT_OPTIONS.items():
+        url = valid_web_url(payment_links.get(method, ""))
+        label = method
+        if method == "Binance Pay / USDT":
+            label += " · 5% de descuento"
+        if url:
+            payment_rows.append(
+                f'<a class="payment-link" href="{safe_text(url)}" target="_blank" '
+                f'rel="noopener noreferrer">{safe_text(label)} · ${cents / 100:.0f} USD</a>'
+            )
+        else:
+            payment_rows.append(
+                f'<span class="payment-link">{safe_text(label)} · '
+                f'${cents / 100:.0f} USD <small>Enlace pendiente de configurar</small></span>'
+            )
+    payment_options = "\n".join(payment_rows)
     return f"""<!doctype html>
 <html lang="es">
   <head>
@@ -134,12 +176,31 @@ def make_prototype_html(name: str, service: str, zone: str) -> str:
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
-    <style>body{{font-family:"DM Sans",sans-serif}}h1,h2,h3{{font-family:"Playfair Display",serif}}</style>
+    <style>
+      body{{font-family:"DM Sans",sans-serif;padding-top:76px}}
+      h1,h2,h3{{font-family:"Playfair Display",serif}}
+      .preview-toolbar{{position:fixed;inset:0 0 auto;z-index:50;display:flex;align-items:center;justify-content:space-between;gap:1rem;background:#10271f;color:white;padding:.8rem clamp(1rem,4vw,3rem);box-shadow:0 8px 24px #0002}}
+      .preview-toolbar p{{margin:0;font-size:.9rem;font-weight:600}}
+      .payment-menu{{position:relative}}
+      .payment-menu summary{{cursor:pointer;list-style:none;border-radius:999px;background:#d8f36a;color:#17220e;padding:.7rem 1rem;font-size:.85rem;font-weight:700;white-space:nowrap}}
+      .payment-menu summary::-webkit-details-marker{{display:none}}
+      .payment-list{{position:absolute;right:0;top:calc(100% + .65rem);display:grid;gap:.45rem;width:min(21rem,90vw);border:1px solid #e7e5e4;border-radius:1rem;background:white;padding:.85rem;box-shadow:0 16px 45px #0003;color:#1c1917}}
+      .payment-link{{display:block;border-radius:.7rem;background:#f5f5f4;padding:.75rem;color:#14532d;font-size:.88rem;font-weight:700;text-decoration:none}}
+      .payment-link:hover{{background:#e7f2e9}}
+      .payment-link small{{display:block;margin-top:.2rem;color:#78716c;font-weight:400}}
+      @media(max-width:520px){{.preview-toolbar{{align-items:flex-start;flex-direction:column}}body{{padding-top:116px}}.payment-list{{left:0;right:auto}}}}
+    </style>
   </head>
   <body class="bg-stone-50 text-stone-900 antialiased">
-    <div class="bg-emerald-950 px-5 py-2 text-center text-xs font-medium tracking-wide text-emerald-50">
-      DEMOSTRACIÓN CONCEPTUAL · Negocio simulado · No publicado
-    </div>
+    <aside class="preview-toolbar">
+      <p>Vista previa exclusiva creada para {business} — Lista para activar</p>
+      <details class="payment-menu">
+        <summary>🚀 Activar en mi dominio hoy</summary>
+        <div class="payment-list" aria-label="Opciones de pago">
+          {payment_options}
+        </div>
+      </details>
+    </aside>
     <header class="mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
       <a href="#" class="text-lg font-bold tracking-tight">{business}</a>
       <a href="#contacto" class="rounded-full bg-emerald-900 px-5 py-3 text-sm font-semibold text-white hover:bg-emerald-800">Solicitar una cita</a>
@@ -182,7 +243,9 @@ def make_prototype_html(name: str, service: str, zone: str) -> str:
 </html>"""
 
 
-def create_prototypes(niche: str, objective: str) -> list[dict]:
+def create_prototypes(
+    niche: str, objective: str, payment_links: dict | None = None
+) -> list[dict]:
     businesses = NICHES[niche]["businesses"]
     match = re.search(r"\b(\d{1,2})\s*(?:prototipos|prospectos|negocios)\b", objective, re.I)
     count = min(int(match.group(1)), 10) if match else 3
@@ -193,7 +256,9 @@ def create_prototypes(niche: str, objective: str) -> list[dict]:
         unique_id = f"{slugify(name)}-{uuid.uuid4().hex[:8]}"
         folder = PENDING_DIR / unique_id
         folder.mkdir(parents=False, exist_ok=False)
-        html_content = make_prototype_html(name, service, NICHES[niche]["zone"])
+        html_content = make_prototype_html(
+            name, service, NICHES[niche]["zone"], payment_links
+        )
         (folder / "index.html").write_text(html_content, encoding="utf-8")
         record = {
             "id": unique_id,
@@ -247,33 +312,106 @@ def register_change_request(state: dict, record: dict, note: str) -> None:
     save_state(state)
 
 
-def proposal_email(record: dict) -> str:
-    return (
-        f"Asunto: Una idea para {record['business_name']}\n\n"
-        f"Hola, equipo de {record['business_name']}:\n\n"
-        f"Preparamos un concepto de página web para {record['service'].lower()} "
-        f"en {record['zone']}, pensado para presentar sus servicios y facilitar "
-        "las solicitudes de cita.\n\n"
-        "La página es solo un prototipo de demostración; no está publicada y su "
-        "formulario de reservas no está conectado. Podemos personalizarla juntos.\n\n"
-        f"{PAYMENT_COPY}\n\n"
-        "Gracias,\nEquipo de Prueba Anticipada"
+def public_demo_url(record: dict, settings: dict) -> str:
+    base_url = valid_web_url(settings.get("prototype_base_url", ""))
+    if not base_url:
+        return ""
+    parsed = urlparse(base_url)
+    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+        return ""
+    return urlunparse(
+        parsed._replace(
+            path=parsed.path or "/",
+            query=urlencode({"demo": record["id"]}),
+            fragment="",
+        )
     )
 
 
-def show_prototype_preview(record: dict, key_prefix: str) -> None:
+def local_demo_url(record: dict) -> str:
+    return f"http://127.0.0.1:8501/?{urlencode({'demo': record['id']})}"
+
+
+def proposal_phase_one(record: dict, demo_link: str) -> str:
+    return (
+        f"Hola, equipo de {record['business_name']}:\n\n"
+        "Notamos que podrían estar perdiendo clientes al no contar con un "
+        "cotizador instantáneo disponible 24/7. Preparamos un prototipo "
+        "interactivo y personalizado para que lo prueben en vivo:\n"
+        f"{demo_link}\n\n"
+        "¿Te gustaría que lo conectemos directo al WhatsApp de tu negocio esta semana?"
+    )
+
+
+def proposal_phase_two(record: dict, settings: dict) -> str:
+    payment_links = settings.get("payment_links", {})
+    options = []
+    for method, amount in (
+        ("Binance Pay / USDT", "$380 USD · 5% de descuento"),
+        ("Payoneer (Tarjeta/ACH)", "$400 USD"),
+        ("PayPal", "$425 USD"),
+    ):
+        url = valid_web_url(payment_links.get(method, ""))
+        link_line = f"\n  {url}" if url else "\n  Enlace oficial pendiente de configurar."
+        options.append(f"• {method}: {amount}{link_line}")
+    return (
+        f"Hola, equipo de {record['business_name']}:\n\n"
+        "¡Qué bueno que les interese! Podemos dejar su prototipo personalizado "
+        "listo en su dominio en 24 horas, con el flujo de contacto adaptado a su negocio.\n\n"
+        "Para comenzar, pueden elegir la opción que mejor les convenga:\n"
+        + "\n".join(options)
+        + f"\n\nUn saludo,\n{settings.get('agency_name', 'Mi agencia')}"
+    )
+
+
+def message_action_links(
+    record: dict,
+    message: str,
+    phase: str,
+    recipient_email: str,
+    recipient_phone: str,
+) -> tuple[str, str]:
+    phone_digits = re.sub(r"\D", "", recipient_phone)
+    whatsapp = f"https://wa.me/{phone_digits}" if phone_digits else "https://wa.me/"
+    whatsapp_url = f"{whatsapp}?{urlencode({'text': message})}"
+    email = quote(recipient_email.strip(), safe="@.+-_")
+    email_url = f"mailto:{email}?{urlencode({'subject': phase, 'body': message})}"
+    return whatsapp_url, email_url
+
+
+def show_prototype_preview(
+    record: dict, key_prefix: str, settings: dict
+) -> None:
     folder = ROOT / record["folder"]
     prototype_path = folder / "index.html"
     if not prototype_path.is_file():
         st.error(f"No se encuentra el prototipo local: {record['folder']}\\index.html")
         return
-    prototype_html = prototype_path.read_text(encoding="utf-8")
-    col_preview, col_download = st.columns([1, 1])
+    prototype_html = make_prototype_html(
+        record["business_name"],
+        record["service"],
+        record["zone"],
+        settings.get("payment_links", {}),
+    )
+    share_url = public_demo_url(record, settings)
+    col_preview, col_open, col_download = st.columns([1, 1, 1])
     with col_preview:
         if st.button("Vista previa del prototipo", key=f"{key_prefix}_preview"):
             st.session_state[f"{key_prefix}_show_preview"] = not st.session_state.get(
                 f"{key_prefix}_show_preview", False
             )
+    with col_open:
+        st.link_button(
+            "Abrir demo para compartir",
+            share_url or local_demo_url(record),
+            disabled=not share_url,
+            help=(
+                None
+                if share_url
+                else "Configura en la barra lateral una URL pública para habilitar un enlace compartible."
+            ),
+            use_container_width=True,
+        )
     with col_download:
         st.download_button(
             "Descargar HTML",
@@ -283,7 +421,12 @@ def show_prototype_preview(record: dict, key_prefix: str) -> None:
             key=f"{key_prefix}_download",
         )
     if st.session_state.get(f"{key_prefix}_show_preview", False):
-        components.html(prototype_html, height=760, scrolling=True)
+        st.iframe(prototype_html, height=760)
+    if not share_url:
+        st.caption(
+            "Esta demo solo está disponible en este equipo. Configura una URL pública "
+            "autorizada antes de compartirla con un prospecto."
+        )
     st.caption(f"Archivo local: {record['folder']}\\index.html")
 
 
@@ -316,7 +459,11 @@ def render_factory_tab(state: dict) -> None:
             progress.progress(30, text="Prospectos de demostración preparados")
             st.write("Agente Dev: generando prototipos HTML locales…")
             try:
-                created = create_prototypes(selected_niche, objective)
+                created = create_prototypes(
+                    selected_niche,
+                    objective,
+                    state["settings"].get("payment_links", {}),
+                )
                 state["prototypes"].extend(created)
                 save_state(state)
             except OSError as exc:
@@ -375,13 +522,114 @@ def render_approval_tab(state: dict) -> None:
                 )
             if record.get("note"):
                 st.info(f"Nota de ajustes: {record['note']}")
-            show_prototype_preview(record, key)
-            with st.expander("Vista previa del correo y opciones de pago"):
-                st.code(proposal_email(record), language="text")
-                st.caption(
-                    "No se proporcionaron URLs de pago: los enlaces oficiales quedan "
-                    "marcados como pendientes y no se inventan."
+            show_prototype_preview(record, key, state["settings"])
+            with st.form(f"contact_form_{key}"):
+                email_col, phone_col, save_col = st.columns([2, 2, 1])
+                with email_col:
+                    recipient_email = st.text_input(
+                        "Correo del prospecto",
+                        value=record.get("contact_email", ""),
+                        key=f"email_{key}",
+                    )
+                with phone_col:
+                    recipient_phone = st.text_input(
+                        "WhatsApp del prospecto (opcional)",
+                        value=record.get("contact_whatsapp", ""),
+                        key=f"phone_{key}",
+                        placeholder="+1 305 555 0100",
+                    )
+                with save_col:
+                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                    save_contact = st.form_submit_button("Guardar contacto")
+                if save_contact:
+                    record["contact_email"] = recipient_email.strip()
+                    record["contact_whatsapp"] = recipient_phone.strip()
+                    save_state(state)
+                    st.session_state["flash_message"] = (
+                        f"Contacto guardado para {record['business_name']}."
+                    )
+                    st.rerun()
+
+            share_url = public_demo_url(record, state["settings"])
+            demo_link = share_url or "[configura una URL pública para compartir esta demo]"
+            phase_one_tab, phase_two_tab = st.tabs(
+                [
+                    "Fase 1: Mensaje de Gancho (Enviar Prototipo)",
+                    "Fase 2: Mensaje de Cierre y Cobro (Enviar Links de Pago)",
+                ]
+            )
+            with phase_one_tab:
+                phase_one_message = proposal_phase_one(record, demo_link)
+                st.code(phase_one_message, language="text")
+                wa_url, email_url = message_action_links(
+                    record,
+                    phase_one_message,
+                    "Tu prototipo personalizado",
+                    record.get("contact_email", ""),
+                    record.get("contact_whatsapp", ""),
                 )
+                whatsapp_col, email_col = st.columns(2)
+                with whatsapp_col:
+                    st.link_button(
+                        "Abrir WhatsApp — Mensaje 1 (Prototipo)",
+                        wa_url,
+                        disabled=not share_url,
+                        use_container_width=True,
+                    )
+                with email_col:
+                    st.link_button(
+                        "Abrir Correo — Mensaje 1 (Prototipo)",
+                        email_url,
+                        disabled=not share_url,
+                        use_container_width=True,
+                    )
+            with phase_two_tab:
+                phase_two_message = proposal_phase_two(record, state["settings"])
+                payment_ready = all(
+                    valid_web_url(url)
+                    for url in state["settings"]["payment_links"].values()
+                )
+                st.code(phase_two_message, language="text")
+                wa_url, email_url = message_action_links(
+                    record,
+                    phase_two_message,
+                    "Siguiente paso para activar su web",
+                    record.get("contact_email", ""),
+                    record.get("contact_whatsapp", ""),
+                )
+                whatsapp_col, email_col = st.columns(2)
+                with whatsapp_col:
+                    st.link_button(
+                        "Abrir WhatsApp — Mensaje 2 (Links de Pago)",
+                        wa_url,
+                        disabled=not payment_ready,
+                        help=(
+                            None
+                            if record.get("contact_whatsapp", "").strip()
+                            else "WhatsApp se abrirá para que elijas el destinatario."
+                        ),
+                        use_container_width=True,
+                    )
+                with email_col:
+                    st.link_button(
+                        "Abrir Correo — Mensaje 2 (Links de Pago)",
+                        email_url,
+                        disabled=(
+                            not payment_ready
+                            or not record.get("contact_email", "").strip()
+                        ),
+                        use_container_width=True,
+                    )
+                if not payment_ready:
+                    st.caption(
+                        "Configura las tres URLs oficiales de pago en la barra lateral "
+                        "para activar los botones de envío de esta fase."
+                    )
+                else:
+                    st.caption(
+                        "Los botones abren un borrador en tu aplicación; revisa el contenido "
+                        "y envíalo manualmente. No se envían mensajes desde el dashboard."
+                    )
             approve_col, reject_col = st.columns(2)
             with approve_col:
                 if st.button(
@@ -440,7 +688,9 @@ def render_approval_tab(state: dict) -> None:
                     f"- **{record['business_name']}** · {record['zone']} · "
                     f"aprobado {record.get('approved_at', '')[:10]}"
                 )
-                show_prototype_preview(record, f"approved_{record['id']}")
+                show_prototype_preview(
+                    record, f"approved_{record['id']}", state["settings"]
+                )
 
 
 def render_finance_tab(state: dict) -> None:
@@ -547,6 +797,104 @@ def render_finance_tab(state: dict) -> None:
                     st.rerun()
 
 
+def render_sidebar_settings(state: dict) -> None:
+    settings = state["settings"]
+    with st.sidebar:
+        st.markdown("# 🎛️ CEO")
+        st.markdown("### Command Center")
+        st.caption("Operaciones locales · Aprobación humana")
+        with st.form("agency_settings_form"):
+            agency_name = st.text_input(
+                "Nombre de mi agencia",
+                value=settings.get("agency_name", "Mi agencia"),
+                help="Se utiliza como firma del mensaje de cierre.",
+            )
+            prototype_base_url = st.text_input(
+                "URL pública autorizada para demos",
+                value=settings.get("prototype_base_url", ""),
+                placeholder="https://demo.tuagencia.com",
+                help=(
+                    "Base de una instancia autorizada que sirve app_ceo.py. No uses "
+                    "localhost para compartir con prospectos."
+                ),
+            )
+            st.markdown("**Enlaces oficiales de pago**")
+            payment_links = {}
+            for method in PAYMENT_OPTIONS:
+                payment_links[method] = st.text_input(
+                    method,
+                    value=settings["payment_links"].get(method, ""),
+                    placeholder="https://…",
+                    key=f"payment_url_{slugify(method)}",
+                )
+            save_settings = st.form_submit_button(
+                "Guardar configuración", use_container_width=True
+            )
+            if save_settings:
+                invalid_urls = [
+                    label
+                    for label, url in [
+                        ("URL pública de demos", prototype_base_url),
+                        *payment_links.items(),
+                    ]
+                    if url.strip() and not valid_web_url(url)
+                ]
+                if invalid_urls:
+                    st.error(
+                        "Usa URLs completas que empiecen por http:// o https://: "
+                        + ", ".join(invalid_urls)
+                    )
+                else:
+                    settings["agency_name"] = agency_name.strip() or "Mi agencia"
+                    settings["prototype_base_url"] = prototype_base_url.strip()
+                    settings["payment_links"] = {
+                        method: url.strip() for method, url in payment_links.items()
+                    }
+                    save_state(state)
+                    st.session_state["flash_message"] = (
+                        "Nombre de agencia y enlaces guardados localmente."
+                    )
+                    st.rerun()
+        st.warning(
+            "Enlaces de demo externos solo después de aprobar el despliegue. "
+            "No compartas públicamente una instancia del CEO Dashboard sin protegerla."
+        )
+        st.divider()
+        st.markdown("**Estado de la fábrica**")
+        pending_count = sum(
+            record.get("status") in ("pending", "changes_requested")
+            for record in state["prototypes"]
+        )
+        st.metric("Propuestas por revisar", pending_count)
+        st.caption("Los botones abren borradores; no se envían mensajes ni pagos.")
+
+
+def render_demo_view(record: dict, state: dict) -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"], [data-testid="stHeader"], footer {display:none !important}
+        .block-container {padding:0 !important; max-width:none !important}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.title(f"Vista previa exclusiva para {record['business_name']}")
+    st.caption(
+        "Concepto de demostración. La activación requiere aprobación explícita, "
+        "configuración de enlaces y publicación autorizada."
+    )
+    st.iframe(
+        make_prototype_html(
+            record["business_name"],
+            record["service"],
+            record["zone"],
+            state["settings"].get("payment_links", {}),
+        ),
+        height=1100,
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="CEO Command Center",
@@ -584,18 +932,23 @@ def main() -> None:
         st.error(f"No se pudieron cargar los datos locales: {exc}")
         st.stop()
 
-    with st.sidebar:
-        st.markdown("# 🎛️ CEO")
-        st.markdown("### Command Center")
-        st.caption("Operaciones locales · Aprobación humana")
-        st.divider()
-        st.markdown("**Estado de la fábrica**")
-        pending_count = sum(
-            record.get("status") in ("pending", "changes_requested")
-            for record in state["prototypes"]
+    demo_id = st.query_params.get("demo")
+    if demo_id:
+        demo_record = next(
+            (
+                record
+                for record in state["prototypes"]
+                if record.get("id") == demo_id
+            ),
+            None,
         )
-        st.metric("Propuestas por revisar", pending_count)
-        st.caption("No se envían correos ni se ejecutan pagos desde esta app.")
+        if demo_record is None:
+            st.error("No se encontró una demo con ese identificador.")
+            st.stop()
+        render_demo_view(demo_record, state)
+        st.stop()
+
+    render_sidebar_settings(state)
     st.title("CEO Command Center")
     st.caption("Tu centro de mando para prototipos, aprobaciones y operaciones de la agencia.")
     flash = st.session_state.pop("flash_message", None)
