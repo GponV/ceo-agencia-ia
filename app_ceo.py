@@ -27,6 +27,7 @@ PENDING_DIR = ROOT / "02_BANDEJA_APROBACION" / "pendientes"
 APPROVED_DIR = ROOT / "02_BANDEJA_APROBACION" / "aprobados"
 DATA_DIR = ROOT / ".ceo_dashboard"
 STATE_FILE = DATA_DIR / "state.json"
+AGENCY_NAME = "Apex AI Agency"
 
 
 @st.cache_resource
@@ -101,7 +102,6 @@ def default_state() -> dict:
         "income": [],
         "clients": [],
         "settings": {
-            "agency_name": "Mi agencia",
             "prototype_base_url": "",
             "payment_links": {method: "" for method in PAYMENT_OPTIONS},
         },
@@ -135,6 +135,7 @@ def _load_state() -> dict:
     settings = state.setdefault("settings", defaults["settings"])
     if not isinstance(settings, dict):
         raise ValueError("La configuración guardada no tiene el formato esperado.")
+    settings.pop("agency_name", None)
     for key, value in defaults["settings"].items():
         settings.setdefault(key, value)
     if not isinstance(settings["payment_links"], dict):
@@ -382,7 +383,7 @@ def make_prototype_html(
   </head>
   <body class="bg-stone-50 text-stone-900 antialiased">
     <aside class="preview-toolbar">
-      <p>Vista previa exclusiva creada para {business} — Lista para activar</p>
+      <p>⚡ Vista previa exclusiva creada por Apex AI Agency para {business}</p>
       <details class="payment-menu"{details_open}>
         <summary>🚀 Activar en mi dominio hoy</summary>
         <div class="payment-list" aria-label="Opciones de pago">
@@ -586,6 +587,7 @@ def proposal_phase_one(record: dict, demo_link: str) -> str:
         "interactivo y personalizado para que lo prueben en vivo:\n"
         f"{demo_link}\n\n"
         "¿Te gustaría que lo conectemos directo al WhatsApp de tu negocio esta semana?"
+        f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}"
     )
 
 
@@ -606,7 +608,7 @@ def proposal_phase_two(record: dict, settings: dict) -> str:
         "listo en su dominio en 24 horas, con el flujo de contacto adaptado a su negocio.\n\n"
         "Para comenzar, pueden elegir la opción que mejor les convenga:\n"
         + "\n".join(options)
-        + f"\n\nUn saludo,\n{settings.get('agency_name', 'Mi agencia')}"
+        + f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}"
     )
 
 
@@ -1081,18 +1083,13 @@ def render_sidebar_settings(state: dict) -> None:
     settings = state["settings"]
     with st.sidebar:
         st.markdown("# 🎛️ CEO")
-        st.markdown("### Command Center")
+        st.markdown(f"### {AGENCY_NAME}")
         st.caption("Operaciones locales · Aprobación humana")
         with st.form("agency_settings_form"):
-            agency_name = st.text_input(
-                "Nombre de mi agencia",
-                value=settings.get("agency_name", "Mi agencia"),
-                help="Se utiliza como firma del mensaje de cierre.",
-            )
             prototype_base_url = st.text_input(
                 "URL pública autorizada para demos",
                 value=settings.get("prototype_base_url", ""),
-                placeholder="https://demo.tuagencia.com",
+                placeholder="https://demos.apexaiagency.com",
                 help=(
                     "Base de una instancia autorizada que sirve app_ceo.py. No uses "
                     "localhost para compartir con prospectos."
@@ -1129,14 +1126,13 @@ def render_sidebar_settings(state: dict) -> None:
                         + ", ".join(invalid_urls)
                     )
                 else:
-                    settings["agency_name"] = agency_name.strip() or "Mi agencia"
                     settings["prototype_base_url"] = prototype_base_url.strip()
                     settings["payment_links"] = {
                         method: url.strip() for method, url in payment_links.items()
                     }
                     save_state(state)
                     st.session_state["flash_message"] = (
-                        "Nombre de agencia y enlaces guardados localmente."
+                        "Enlaces de demo y pago guardados localmente."
                     )
                     st.rerun()
         st.warning(
@@ -1372,8 +1368,8 @@ def main() -> None:
         st.stop()
 
     render_sidebar_settings(state)
-    st.title("CEO Command Center")
-    st.caption("Tu centro de mando para prototipos, aprobaciones y operaciones de la agencia.")
+    st.title(f"{AGENCY_NAME} — CEO Command Center")
+    st.caption("Centro de mando de Apex AI Agency para prototipos, aprobaciones y operaciones.")
     flash = st.session_state.pop("flash_message", None)
     if flash:
         st.success(flash)
