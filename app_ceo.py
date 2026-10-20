@@ -29,6 +29,13 @@ DATA_DIR = ROOT / ".ceo_dashboard"
 STATE_FILE = DATA_DIR / "state.json"
 AGENCY_NAME = "Apex AI Agency"
 SUPPORT_EMAIL = "hello.apexrepurposing@gmail.com"
+BRAND_LOGO_SVG = """
+<svg class="apex-mark" viewBox="0 0 48 48" role="img" aria-label="Apex AI Agency">
+  <path d="M24 3.5 42 14v20L24 44.5 6 34V14L24 3.5Z" fill="none" stroke="#00F2FE" stroke-width="2"/>
+  <path d="m14 31 10-17 10 17M18.2 24h11.6" fill="none" stroke="#00F2FE" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.8"/>
+  <circle cx="35.5" cy="12.5" r="2.5" fill="#10B981"/>
+</svg>
+"""
 CONTRACT_STATUSES = {
     "pending_verification": "Pago reportado · pendiente de verificación",
     "paid_activation": "Pagado · en activación",
@@ -250,6 +257,7 @@ def enviar_correo_cliente(destinatario: str, asunto: str, cuerpo: str) -> None:
     message["To"] = parsed_recipient
     message["Subject"] = asunto
     message.set_content(cuerpo)
+    message.add_alternative(render_email_html(cuerpo), subtype="html")
     try:
         with smtplib.SMTP_SSL(
             "smtp.gmail.com", 465, timeout=10, context=ssl.create_default_context()
@@ -262,6 +270,70 @@ def enviar_correo_cliente(destinatario: str, asunto: str, cuerpo: str) -> None:
         ) from None
     if refused:
         raise RuntimeError("El servidor SMTP rechazó el destinatario.")
+
+
+def brand_logo_html() -> str:
+    return (
+        '<div class="apex-brand">'
+        f"{BRAND_LOGO_SVG}"
+        '<span class="apex-brand-copy"><strong>Apex AI</strong>'
+        '<small>AGENCY</small></span></div>'
+    )
+
+
+def render_email_html(body: str) -> str:
+    content_blocks = []
+    for line in body.splitlines():
+        escaped_line = html.escape(line.strip())
+        if not escaped_line:
+            continue
+        url_match = re.fullmatch(r"https?://[^\s]+", line.strip())
+        if url_match and valid_web_url(url_match.group(0)):
+            url = html.escape(url_match.group(0), quote=True)
+            content_blocks.append(
+                f'<p class="cta-wrap"><a class="cta" href="{url}" '
+                f'target="_blank" rel="noopener noreferrer">Abrir enlace seguro</a></p>'
+            )
+        else:
+            content_blocks.append(f"<p>{escaped_line}</p>")
+    body_content = "\n".join(content_blocks)
+    return f"""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{{margin:0;background:#f1f5f9;color:#182230;font-family:Arial,Helvetica,sans-serif}}
+    .page{{width:100%;padding:28px 12px;background:#f1f5f9}}
+    .card{{max-width:620px;margin:0 auto;overflow:hidden;border:1px solid #e2e8f0;border-radius:18px;background:#fff;box-shadow:0 12px 35px #0b0f1912}}
+    .header{{padding:24px 30px;background:#0B0F19;color:#fff}}
+    .apex-brand{{display:flex;align-items:center;gap:12px;color:#fff;text-decoration:none}}
+    .apex-mark{{width:42px;height:42px;flex:0 0 42px}}
+    .apex-brand-copy{{display:flex;flex-direction:column;line-height:1}}
+    .apex-brand-copy strong{{font-size:18px;letter-spacing:.02em}}
+    .apex-brand-copy small{{margin-top:5px;color:#00F2FE;font-size:9px;font-weight:700;letter-spacing:.28em}}
+    .accent{{height:3px;background:linear-gradient(90deg,#00F2FE,#10B981)}}
+    .content{{padding:28px 30px 24px;font-size:15px;line-height:1.7;overflow-wrap:anywhere}}
+    .content p{{margin:0 0 13px}}
+    .cta-wrap{{margin:20px 0!important}}
+    .cta{{display:inline-block;border-radius:9px;background:#00bcca;padding:12px 19px;color:#06151a!important;font-weight:700;text-decoration:none}}
+    .footer{{padding:18px 30px;background:#f8fafc;color:#64748b;font-size:12px;line-height:1.6}}
+    .footer a{{color:#087d89;text-decoration:none;font-weight:700}}
+    @media only screen and (max-width:520px){{.page{{padding:12px 6px}}.header,.content,.footer{{padding-left:20px;padding-right:20px}}.content{{font-size:14px}}}}
+  </style>
+</head>
+<body>
+  <div class="page"><div class="card">
+    <div class="header">{brand_logo_html()}</div>
+    <div class="accent"></div>
+    <main class="content">{body_content}</main>
+    <footer class="footer">
+      Apex AI Agency · Soluciones digitales para negocios locales<br>
+      Soporte oficial: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
+    </footer>
+  </div></div>
+</body>
+</html>"""
 
 
 def render_delivery_note(contract: dict) -> str:
@@ -565,10 +637,15 @@ def make_prototype_html(
     <style>
       body{{font-family:"DM Sans",sans-serif;padding-top:76px}}
       h1,h2,h3{{font-family:"Playfair Display",serif}}
-      .preview-toolbar{{position:fixed;inset:0 0 auto;z-index:50;display:flex;align-items:center;justify-content:space-between;gap:1rem;background:#10271f;color:white;padding:.8rem clamp(1rem,4vw,3rem);box-shadow:0 8px 24px #0002}}
+      .preview-toolbar{{position:fixed;inset:0 0 auto;z-index:50;display:flex;align-items:center;justify-content:space-between;gap:1rem;background:#0B0F19;color:white;padding:.8rem clamp(1rem,4vw,3rem);box-shadow:0 8px 24px #0003;border-bottom:1px solid #00f2fe55}}
       .preview-toolbar p{{margin:0;font-size:.9rem;font-weight:600}}
+      .apex-brand{{display:inline-flex;align-items:center;gap:.7rem;color:#fff;text-decoration:none;white-space:nowrap}}
+      .apex-mark{{width:40px;height:40px;flex:0 0 40px}}
+      .apex-brand-copy{{display:flex;flex-direction:column;line-height:1}}
+      .apex-brand-copy strong{{font-family:"DM Sans",sans-serif;font-size:1rem;letter-spacing:.01em}}
+      .apex-brand-copy small{{margin-top:.28rem;color:#00F2FE;font-size:.55rem;font-weight:700;letter-spacing:.28em}}
       .payment-menu{{position:relative}}
-      .payment-menu summary{{cursor:pointer;list-style:none;border-radius:999px;background:#d8f36a;color:#17220e;padding:.7rem 1rem;font-size:.85rem;font-weight:700;white-space:nowrap}}
+      .payment-menu summary{{cursor:pointer;list-style:none;border-radius:999px;background:#10B981;color:#052117;padding:.7rem 1rem;font-size:.85rem;font-weight:700;white-space:nowrap;box-shadow:0 6px 18px #10b98135}}
       .payment-menu summary::-webkit-details-marker{{display:none}}
       .payment-list{{position:absolute;right:0;top:calc(100% + .65rem);display:grid;gap:.45rem;width:min(21rem,90vw);border:1px solid #e7e5e4;border-radius:1rem;background:white;padding:.85rem;box-shadow:0 16px 45px #0003;color:#1c1917}}
       .payment-link{{display:block;border-radius:.7rem;background:#f5f5f4;padding:.75rem;color:#14532d;font-size:.88rem;font-weight:700;text-decoration:none}}
@@ -580,12 +657,15 @@ def make_prototype_html(
       .simulator-card input,.simulator-card select{{width:100%;border:1px solid #d6d3d1;border-radius:.65rem;padding:.7rem;margin:.35rem 0 .8rem}}
       .simulator-result{{border-radius:.75rem;background:#ecfdf5;padding:.9rem;color:#14532d;font-weight:700}}
       .faq-item{{border-bottom:1px solid #e7e5e4;padding:1rem 0}}
-      @media(max-width:520px){{.preview-toolbar{{align-items:flex-start;flex-direction:column}}body{{padding-top:116px}}.payment-list{{left:0;right:auto}}}}
+      @media(max-width:520px){{.preview-toolbar{{align-items:flex-start;flex-direction:column}}body{{padding-top:130px}}.payment-list{{left:0;right:auto}}}}
     </style>
   </head>
   <body class="bg-stone-50 text-stone-900 antialiased">
     <aside class="preview-toolbar">
-      <p>⚡ Vista previa exclusiva creada por Apex AI Agency para {business} — Prototipo reservado por tiempo limitado (Expira en 48h) · {support_email}</p>
+      <div class="flex items-center gap-3">
+        {brand_logo_html()}
+        <p>Vista previa exclusiva para {business} · Expira en 48h</p>
+      </div>
       <details class="payment-menu"{details_open}>
         <summary>🚀 Activar en mi dominio hoy</summary>
         <div class="payment-list" aria-label="Opciones de pago">
@@ -1629,9 +1709,15 @@ def render_finance_tab(state: dict) -> None:
 def render_sidebar_settings(state: dict) -> None:
     settings = state["settings"]
     with st.sidebar:
-        st.markdown("# 🎛️ CEO")
-        st.markdown(f"### {AGENCY_NAME}")
-        st.caption("Operaciones locales · Aprobación humana")
+        st.markdown(
+            f"""
+            <div class="sidebar-brand">
+              {brand_logo_html()}
+              <span class="sidebar-role">CEO COMMAND CENTER</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.caption(f"Correo oficial de soporte: {support_email_visual()}")
         with st.form("agency_settings_form"):
             prototype_base_url = st.text_input(
@@ -1971,22 +2057,54 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: #0b1017; }
-        [data-testid="stHeader"] { background: rgba(11, 16, 23, .85); }
-        [data-testid="stSidebar"] { background: #101824; border-right: 1px solid #263243; }
+        :root { --apex-space: #0B0F19; --apex-cyan: #00F2FE; --apex-green: #10B981; }
+        .stApp { background: radial-gradient(ellipse at 80% -15%, #12333b 0, transparent 36%), #0B0F19; }
+        [data-testid="stHeader"] { background: rgba(11, 15, 25, .9); }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, #101827, #0c121d); border-right: 1px solid #243243; }
+        [data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
+        .sidebar-brand { margin: 0 0 1.2rem; padding: .25rem .2rem 1rem; border-bottom: 1px solid #263243; }
+        .sidebar-brand .apex-mark { width: 46px; height: 46px; }
+        .sidebar-brand .apex-brand-copy strong { font-size: 1.05rem; color: white; }
+        .sidebar-brand .apex-brand-copy small { color: var(--apex-cyan); }
+        .sidebar-role { display: block; margin: .75rem 0 0 .2rem; color: #8493a7; font-size: .65rem; font-weight: 700; letter-spacing: .18em; }
+        h1, h2, h3 { letter-spacing: -.025em; }
+        h1 { color: #f7fbff; }
+        [data-testid="stCaptionContainer"], [data-testid="stMarkdownContainer"] p { color: #aebacc; }
         [data-testid="stMetric"] {
-            background: #121b27; border: 1px solid #253345;
-            padding: 1rem 1.1rem; border-radius: 14px;
+            background: linear-gradient(145deg, #141f2d, #101824); border: 1px solid #29394a;
+            padding: 1rem 1.1rem; border-radius: 16px; box-shadow: 0 12px 30px #0002;
         }
         [data-testid="stVerticalBlockBorderWrapper"] {
-            background: #101824; border-color: #293648;
-            border-radius: 18px; padding: .7rem;
+            background: linear-gradient(145deg, #111b28, #0e1621); border-color: #26374a;
+            border-radius: 18px; padding: .7rem; box-shadow: 0 14px 34px #0002;
         }
         .stButton > button, .stDownloadButton > button {
-            border-radius: 10px; min-height: 2.8rem; font-weight: 650;
+            border: 1px solid #314357; border-radius: 11px; min-height: 2.8rem;
+            background: linear-gradient(135deg, #182638, #121d2b); color: #edf8ff; font-weight: 650;
+            transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
         }
-        .stTextArea textarea, .stTextInput input, [data-baseweb="select"] > div {
-            background: #121b27;
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            border-color: var(--apex-cyan); color: white; transform: translateY(-1px);
+            box-shadow: 0 7px 22px #00f2fe1c;
+        }
+        .stButton > button[kind="primary"] {
+            border-color: #10B981; background: linear-gradient(135deg, #10B981, #087c62); color: #031a14;
+        }
+        .stTextArea textarea, .stTextInput input, [data-baseweb="select"] > div,
+        [data-testid="stNumberInput"] input {
+            background: #101a27; border-color: #304052; border-radius: 10px; color: #f1f5f9;
+        }
+        .stTextArea textarea:focus, .stTextInput input:focus, [data-testid="stNumberInput"] input:focus {
+            border-color: var(--apex-cyan); box-shadow: 0 0 0 1px var(--apex-cyan);
+        }
+        [data-baseweb="tab-list"] { gap: .45rem; border-bottom: 1px solid #29384a; }
+        [data-baseweb="tab"] { border-radius: 10px 10px 0 0; color: #aebacc; }
+        [aria-selected="true"][data-baseweb="tab"] { color: var(--apex-cyan); }
+        [data-testid="stForm"] { border-color: #29394a; border-radius: 16px; background: #0e1723; }
+        [data-testid="stAlert"] { border-radius: 12px; }
+        a { color: var(--apex-cyan); }
+        @media(max-width:700px) {
+            [data-testid="stMetric"] { padding: .8rem; }
         }
         </style>
         """,
