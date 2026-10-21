@@ -771,6 +771,20 @@ def valid_web_url(value: str) -> str:
     return candidate
 
 
+def payment_value(settings: dict, method: str) -> str:
+    links = settings.get("payment_links", {})
+    value = links.get(method, "") if isinstance(links, dict) else ""
+    return str(value).strip() if value is not None else ""
+
+
+def paypal_me_url(value: str) -> str:
+    candidate = valid_web_url(value)
+    if not candidate or urlparse(candidate).scheme != "https":
+        return ""
+    hostname = (urlparse(candidate).hostname or "").lower()
+    return candidate if hostname in ("paypal.me", "www.paypal.me") else ""
+
+
 def make_prototype_html(
     name: str,
     service: str,
@@ -786,22 +800,46 @@ def make_prototype_html(
     niche_type = "clinic" if "Madrid" in zone else "home_service"
     payment_links = payment_links or {}
     payment_rows = []
+    payment_copy_values = []
     for method, cents in PAYMENT_OPTIONS.items():
-        url = valid_web_url(payment_links.get(method, ""))
+        configured_value = str(payment_links.get(method, "") or "").strip()
         label = method
         if method == "Binance Pay / USDT":
             label += " · 5% de descuento"
-        if url:
-            payment_rows.append(
-                f'<a class="payment-link" href="{safe_text(url)}" target="_blank" '
-                f'rel="noopener noreferrer">{safe_text(label)} · ${cents / 100:.0f} USD</a>'
-            )
+        safe_value = safe_text(configured_value)
+        safe_label = safe_text(label)
+        price = f"${cents / 100:.0f} USD"
+        if not configured_value:
+            content = "<small>Datos de pago pendientes de configurar</small>"
         else:
-            payment_rows.append(
-                f'<span class="payment-link">{safe_text(label)} · '
-                f'${cents / 100:.0f} USD <small>Enlace pendiente de configurar</small></span>'
+            copy_id = f"payment-copy-{len(payment_copy_values)}"
+            payment_copy_values.append(configured_value)
+            copy_button = (
+                f'<button class="copy-payment" type="button" data-copy-id="{copy_id}" '
+                'aria-label="Copiar datos de pago">Copiar</button>'
             )
+            if method == "PayPal" and paypal_me_url(configured_value):
+                paypal_url = safe_text(paypal_me_url(configured_value))
+                content = (
+                    f'<a class="payment-destination" href="{paypal_url}" '
+                    f'target="_blank" rel="noopener noreferrer">{safe_value}</a>'
+                    f"{copy_button}"
+                )
+            else:
+                content = (
+                    f'<span class="payment-destination">{safe_value}</span>{copy_button}'
+                )
+            content = (
+                f'<span id="{copy_id}" class="copy-source">{safe_value}</span>{content}'
+            )
+        payment_rows.append(
+            f'<div class="payment-link"><strong>{safe_label} · {price}</strong>'
+            f'<div class="payment-detail">{content}</div></div>'
+        )
     payment_options = "\n".join(payment_rows)
+    payment_copy_json = json.dumps(payment_copy_values, ensure_ascii=True).replace(
+        "<", "\\u003c"
+    )
     payment_tracking_script = ""
     if track_payment_open:
         event_query = json.dumps(
@@ -842,8 +880,14 @@ def make_prototype_html(
       .payment-menu summary::-webkit-details-marker{{display:none}}
       .payment-list{{position:absolute;right:0;top:calc(100% + .65rem);display:grid;gap:.45rem;width:min(21rem,90vw);border:1px solid #e7e5e4;border-radius:1rem;background:white;padding:.85rem;box-shadow:0 16px 45px #0003;color:#1c1917}}
       .payment-link{{display:block;border-radius:.7rem;background:#f5f5f4;padding:.75rem;color:#14532d;font-size:.88rem;font-weight:700;text-decoration:none}}
-      .payment-link:hover{{background:#e7f2e9}}
       .payment-link small{{display:block;margin-top:.2rem;color:#78716c;font-weight:400}}
+      .payment-detail{{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.5rem;color:#334155;font-size:.82rem;font-weight:500;overflow-wrap:anywhere}}
+      .payment-destination{{min-width:0;white-space:pre-wrap;overflow-wrap:anywhere}}
+      a.payment-destination{{color:#075985;font-weight:700;text-decoration:underline}}
+      .copy-source{{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:pre-wrap}}
+      .copy-payment{{flex:0 0 auto;border:0;border-radius:999px;background:#0B0F19;color:#00F2FE;padding:.4rem .7rem;font-size:.72rem;font-weight:700;cursor:pointer}}
+      .copy-payment:hover{{background:#162436}}
+      .copy-notice{{position:fixed;right:1rem;bottom:1rem;z-index:60;border-radius:.7rem;background:#0B0F19;color:#fff;padding:.7rem 1rem;font-size:.82rem;box-shadow:0 8px 24px #0003}}
       .simulator-card{{border:1px solid #e7e5e4;border-radius:1.25rem;background:#fff;padding:1.25rem}}
       .simulator-card input,.simulator-card select{{width:100%;border:1px solid #d6d3d1;border-radius:.65rem;padding:.7rem;margin:.35rem 0 .8rem}}
       .simulator-result{{border-radius:.75rem;background:#ecfdf5;padding:.9rem;color:#14532d;font-weight:700}}
@@ -929,6 +973,35 @@ def make_prototype_html(
     </main>
     <footer class="border-t border-stone-200 px-6 py-6 text-center text-xs text-stone-500">© 2026 {business} · Concepto de demostración sin conexión de reservas · Vista creada por {AGENCY_NAME} · <a href="mailto:{support_email}">{support_email}</a></footer>
     <script>
+      const paymentCopyValues = {payment_copy_json};
+      document.querySelectorAll(".copy-payment").forEach(button => {{
+        button.addEventListener("click", async () => {{
+          const index = Number(button.dataset.copyId.replace("payment-copy-", ""));
+          const value = paymentCopyValues[index];
+          if (!value) return;
+          try {{
+            await navigator.clipboard.writeText(value);
+          }} catch (error) {{
+            const helper = document.createElement("textarea");
+            helper.value = value;
+            helper.style.position = "fixed";
+            helper.style.opacity = "0";
+            document.body.appendChild(helper);
+            helper.select();
+            const copied = document.execCommand("copy");
+            helper.remove();
+            if (!copied) {{
+              window.prompt("Copia estos datos de pago:", value);
+              return;
+            }}
+          }}
+          const notice = document.createElement("div");
+          notice.className = "copy-notice";
+          notice.textContent = "Datos de pago copiados";
+          document.body.appendChild(notice);
+          window.setTimeout(() => notice.remove(), 1800);
+        }});
+      }});
       const nicheType = "{niche_type}";
       const services = nicheType === "clinic"
         ? [{{name:"Consulta inicial",low:50,high:90}},{{name:"Tratamiento estético",low:90,high:250}},{{name:"Consulta dental",low:40,high:100}}]
@@ -1130,9 +1203,13 @@ def proposal_phase_two(record: dict, settings: dict) -> str:
         ("Payoneer (Tarjeta/ACH)", "$400 USD"),
         ("PayPal", "$425 USD"),
     ):
-        url = valid_web_url(payment_links.get(method, ""))
-        link_line = f"\n  {url}" if url else "\n  Enlace oficial pendiente de configurar."
-        options.append(f"• {method}: {amount}{link_line}")
+        configured_value = str(payment_links.get(method, "") or "").strip()
+        data_line = (
+            f"\n  Datos configurados: {configured_value}"
+            if configured_value
+            else "\n  Datos oficiales pendientes de configurar."
+        )
+        options.append(f"• {method}: {amount}{data_line}")
     return (
         f"Hola, equipo de {record['business_name']}:\n\n"
         "¡Qué bueno que les interese! Podemos dejar su prototipo personalizado "
@@ -1342,7 +1419,7 @@ def render_approval_tab(state: dict) -> None:
             with phase_two_tab:
                 phase_two_message = proposal_phase_two(record, state["settings"])
                 payment_ready = all(
-                    valid_web_url(url)
+                    str(url).strip()
                     for url in state["settings"]["payment_links"].values()
                 )
                 st.code(phase_two_message, language="text")
@@ -1362,7 +1439,7 @@ def render_approval_tab(state: dict) -> None:
                 )
                 if not payment_ready:
                     st.caption(
-                        "Configura las tres URLs oficiales de pago en la barra lateral "
+                        "Configura los datos oficiales de cada pasarela en la barra lateral "
                         "para activar los botones de envío de esta fase."
                     )
                 else:
@@ -1911,35 +1988,43 @@ def render_sidebar_settings(state: dict) -> None:
                         "localhost para compartir con prospectos."
                     ),
                 )
-                st.markdown("**Enlaces oficiales de pago**")
+                st.markdown("**Datos oficiales de pago**")
                 payment_links = {}
                 for method in PAYMENT_OPTIONS:
-                    payment_links[method] = st.text_input(
+                    placeholders = {
+                        "Binance Pay / USDT": "UID45489956",
+                        "Payoneer (Tarjeta/ACH)": "Correo o datos de la cuenta receptora en USD",
+                        "PayPal": "https://paypal.me/tuusuario o correo de PayPal",
+                    }
+                    field = (
+                        st.text_area
+                        if method == "Payoneer (Tarjeta/ACH)"
+                        else st.text_input
+                    )
+                    payment_links[method] = field(
                         method,
                         value=settings["payment_links"].get(method, ""),
-                        placeholder="https://…",
+                        placeholder=placeholders[method],
                         key=f"payment_url_{slugify(method)}",
+                        **(
+                            {"height": 72}
+                            if method == "Payoneer (Tarjeta/ACH)"
+                            else {}
+                        ),
                     )
                 save_settings = st.form_submit_button(
                     "Guardar configuración", use_container_width=True
                 )
                 if save_settings:
-                    invalid_urls = [
-                        label
-                        for label, url in [
-                            ("URL pública de demos", prototype_base_url),
-                            *payment_links.items(),
-                        ]
-                        if url.strip()
+                    if (
+                        prototype_base_url.strip()
                         and (
-                            not valid_web_url(url)
-                            or urlparse(url).scheme != "https"
+                            not valid_web_url(prototype_base_url)
+                            or urlparse(prototype_base_url).scheme != "https"
                         )
-                    ]
-                    if invalid_urls:
+                    ):
                         st.error(
-                            "Usa URLs HTTPS completas para la demo y los enlaces de pago: "
-                            + ", ".join(invalid_urls)
+                            "La URL pública de demos debe ser una dirección HTTPS válida."
                         )
                     else:
                         settings["prototype_base_url"] = prototype_base_url.strip()
