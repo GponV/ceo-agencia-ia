@@ -9,6 +9,7 @@ import smtplib
 import ssl
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -16,9 +17,8 @@ from datetime import date, datetime
 from email.message import EmailMessage
 from email.utils import parseaddr
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlparse, urlunparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
-import requests
 import streamlit as st
 
 
@@ -123,6 +123,8 @@ def default_state() -> dict:
         "clients": [],
         "contracts": [],
         "purchase_notifications": [],
+        "activity_alerts": [],
+        "quote_requests": [],
         "settings": {
             "prototype_base_url": "",
             "payment_links": {method: "" for method in PAYMENT_OPTIONS},
@@ -155,7 +157,12 @@ def _load_state() -> dict:
             f"El archivo {STATE_FILE.relative_to(ROOT)} no tiene el formato esperado."
         )
     defaults = default_state()
-    for key in ("contracts", "purchase_notifications"):
+    for key in (
+        "contracts",
+        "purchase_notifications",
+        "activity_alerts",
+        "quote_requests",
+    ):
         value = state.setdefault(key, [])
         if not isinstance(value, list):
             raise ValueError(f"La sección {key} guardada no tiene el formato esperado.")
@@ -207,36 +214,6 @@ def support_email_visual() -> str:
         return SUPPORT_EMAIL
     parsed = parseaddr(sender)[1]
     return parsed if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", parsed) else SUPPORT_EMAIL
-
-
-def notificar_ceo_whatsapp(mensaje: str) -> str | None:
-    try:
-        api_id = required_secret("GREEN_API_ID")
-        api_token = required_secret("GREEN_API_TOKEN")
-        chat_id = f"{required_secret('CEO_WHATSAPP')}"
-        if not re.fullmatch(r"\d+@c\.us", chat_id):
-            raise RuntimeError(
-                "CEO_WHATSAPP debe ser el chatId personal con formato numérico y sufijo @c.us."
-            )
-        clean_message = mensaje.strip()
-        if not clean_message:
-            raise ValueError("El mensaje de WhatsApp no puede estar vacío.")
-        endpoint = (
-            f"https://{api_id}.api.greenapi.com/waInstance{api_id}"
-            f"/sendMessage/{api_token}"
-        )
-        response = requests.post(
-            endpoint,
-            json={"chatId": chat_id, "message": clean_message},
-            timeout=10,
-        )
-        response.raise_for_status()
-    except Exception as exc:
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
-        error_type = "HTTP" if status_code else type(exc).__name__
-        status = f" {status_code}" if status_code else ""
-        return f"Green-API no pudo enviar la notificación ({error_type}{status})."
-    return None
 
 
 def enviar_correo_cliente(destinatario: str, asunto: str, cuerpo: str) -> None:
@@ -356,7 +333,7 @@ def render_delivery_note(contract: dict) -> str:
         f"Importe registrado: {money(amount)}\n"
         f"Referencia de pago: {contract.get('payment_reference') or 'No indicada'}\n\n"
         "SERVICIOS INCLUIDOS\n"
-        f"{contract.get('delivery_details') or 'Sistema de Captación Web; Cotizador IA; Integración WhatsApp'}\n\n"
+        f"{contract.get('delivery_details') or 'Sistema de Captación Web; Cotizador IA; Integración de mensajería'}\n\n"
         f"Garantía: {warranty}\n\n"
         "Soporte oficial: hello.apexrepurposing@gmail.com\n\n"
         f"Documento emitido por el equipo de {AGENCY_NAME}.\n"
@@ -377,6 +354,253 @@ def enviar_nota_entrega_cliente(contract: dict) -> None:
         raise ValueError("El contrato no contiene un correo válido del cliente.")
     subject = f"Nota de Entrega Oficial — {AGENCY_NAME} — {contract.get('business_name', '')}"
     enviar_correo_cliente(recipient, subject, render_delivery_note(contract))
+
+
+def enviar_alerta_ceo(tipo_evento: str, detalles_cliente: dict) -> dict:
+    event_labels = {
+        "new_purchase": "Nueva compra o activación",
+        "delivery_note_request": "Solicitud de Nota de Entrega",
+        "custom_quote_request": "Solicitud de presupuesto personalizado",
+    }
+    if tipo_evento not in event_labels:
+        raise ValueError("Tipo de alerta no reconocido.")
+    if not isinstance(detalles_cliente, dict):
+        raise ValueError("Los detalles de la alerta deben ser un objeto.")
+
+    alert = {
+        "id": uuid.uuid4().hex,
+        "event_type": tipo_evento,
+        "event_label": event_labels[tipo_evento],
+        "customer_name": str(detalles_cliente.get("customer_name", "Cliente")).strip(),
+        "customer_email": str(detalles_cliente.get("customer_email", "")).strip(),
+        "business_name": str(detalles_cliente.get("business_name", "No indicado")).strip(),
+        "details": str(detalles_cliente.get("details", "")).strip(),
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": "email_queued",
+    }
+    with STATE_LOCK:
+        state = load_state()
+        state["activity_alerts"].insert(0, alert)
+        save_state(state)
+
+    subject = f"[{AGENCY_NAME}] {alert['event_label']} · {alert['business_name']}"
+    body = (
+        f"Evento: {alert['event_label']}\n"
+        f"Negocio: {alert['business_name']}\n"
+        f"Cliente: {alert['customer_name']}\n"
+        f"Correo: {alert['customer_email'] or 'No indicado'}\n\n"
+        f"Detalles:\n{alert['details'] or 'Sin detalles adicionales'}\n\n"
+        f"Fecha: {alert['created_at']}\n"
+        f"ID de alerta: {alert['id']}"
+    )
+    try:
+        enqueue_background_job(
+            f"Alerta para CEO: {alert['event_label']}",
+            enviar_correo_cliente,
+            SUPPORT_EMAIL,
+            subject,
+            body,
+            kind="ceo_alert",
+            record_id=alert["id"],
+        )
+    except Exception as exc:
+        with STATE_LOCK:
+            state = load_state()
+            saved_alert = next(
+                (item for item in state["activity_alerts"] if item["id"] == alert["id"]),
+                None,
+            )
+            if saved_alert:
+                saved_alert["status"] = "queue_failed"
+                saved_alert["email_error"] = type(exc).__name__
+                save_state(state)
+        alert["status"] = "queue_failed"
+        alert["email_error"] = type(exc).__name__
+        return alert
+    return alert
+
+
+def estimate_custom_quote(extras: str) -> dict:
+    normalized = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", extras.casefold())
+        if not unicodedata.combining(character)
+    )
+    line_items = [
+        ("Implementación base", PAYMENT_OPTIONS["Binance Pay / USDT"]),
+    ]
+    if any(term in normalized for term in ("automatizacion", "automation", "integracion")):
+        line_items.append(("Automatización adicional", 15000))
+    if any(term in normalized for term in ("sede", "sucursal", "ubicacion", "location")):
+        line_items.append(("Sede adicional", 12500))
+    if any(term in normalized for term in ("avanzado", "premium", "personalizado", "custom")):
+        line_items.append(("Diseño avanzado", 20000))
+    total_cents = sum(amount for _, amount in line_items)
+    return {
+        "line_items": [
+            {"description": description, "amount_cents": amount}
+            for description, amount in line_items
+        ],
+        "total_cents": total_cents,
+        "status": "estimated_pending_approval",
+    }
+
+
+def render_custom_quote(quote_request: dict) -> str:
+    items = "\n".join(
+        f"• {item['description']}: {money(item['amount_cents'])}"
+        for item in quote_request["line_items"]
+    )
+    return (
+        f"PRESUPUESTO ESTIMADO — {AGENCY_NAME}\n\n"
+        f"Cliente: {quote_request['customer_name']}\n"
+        f"Negocio: {quote_request['business_name']}\n"
+        f"Alcance solicitado: {quote_request['scope']}\n\n"
+        "DESGLOSE ESTIMADO\n"
+        f"{items}\n\n"
+        f"Total estimado: {money(quote_request['total_cents'])}\n\n"
+        "Esta propuesta es una estimación sujeta a revisión y aprobación expresa "
+        "del equipo de Apex AI Agency. No constituye una orden de trabajo ni inicia "
+        "una activación. El alcance y los plazos se confirmarán por escrito antes "
+        "de iniciar cualquier trabajo.\n\n"
+        f"Soporte: {SUPPORT_EMAIL}\n"
+        f"Equipo de {AGENCY_NAME}"
+    )
+
+
+def solicitar_presupuesto_personalizado(datos_solicitud: dict) -> dict:
+    required_fields = ("customer_name", "customer_email", "business_name", "scope")
+    if any(
+        not str(datos_solicitud.get(field, "")).strip()
+        for field in required_fields
+    ):
+        raise ValueError("Completa nombre, correo, negocio y alcance solicitado.")
+    customer_email = str(datos_solicitud["customer_email"]).strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", customer_email):
+        raise ValueError("Indica una dirección de correo válida.")
+
+    quote_request = {
+        "id": uuid.uuid4().hex,
+        "prototype_id": str(datos_solicitud.get("prototype_id", "")),
+        "customer_name": str(datos_solicitud["customer_name"]).strip(),
+        "customer_email": customer_email,
+        "business_name": str(datos_solicitud["business_name"]).strip(),
+        "scope": str(datos_solicitud["scope"]).strip()[:4000],
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    quote_request.update(estimate_custom_quote(quote_request["scope"]))
+    with STATE_LOCK:
+        state = load_state()
+        state["quote_requests"].insert(0, quote_request)
+        save_state(state)
+
+    document = render_custom_quote(quote_request)
+    subject = f"Presupuesto estimado de {AGENCY_NAME} · {quote_request['business_name']}"
+    enqueue_background_job(
+        f"Presupuesto para cliente: {quote_request['business_name']}",
+        enviar_correo_cliente,
+        customer_email,
+        subject,
+        document,
+    )
+    enqueue_background_job(
+        f"Presupuesto para CEO: {quote_request['business_name']}",
+        enviar_correo_cliente,
+        SUPPORT_EMAIL,
+        f"[Revisión CEO] {subject}",
+        document,
+    )
+    enviar_alerta_ceo(
+        "custom_quote_request",
+        {
+            **quote_request,
+            "details": (
+                f"Alcance: {quote_request['scope']}\n"
+                f"Total estimado: {money(quote_request['total_cents'])}\n"
+                f"Solicitud: {quote_request['id']}"
+            ),
+        },
+    )
+    return quote_request
+
+
+def render_quote_request_form(
+    business_name: str, prototype_id: str, key_prefix: str
+) -> dict | None:
+    st.markdown("#### Solicitar Presupuesto a la Medida")
+    st.caption(
+        "La estimación aplica tarifas base y extras por alcance; queda sujeta a "
+        "revisión y aprobación del CEO antes de convertirse en una propuesta definitiva."
+    )
+    with st.form(f"custom_quote_form_{key_prefix}", clear_on_submit=True):
+        customer_name = st.text_input("Nombre", key=f"{key_prefix}_customer_name")
+        customer_email = st.text_input("Correo electrónico", key=f"{key_prefix}_customer_email")
+        submitted_business_name = st.text_input(
+            "Nombre del negocio",
+            value=business_name,
+            key=f"{key_prefix}_business_name",
+        )
+        scope = st.text_area(
+            "Alcance adicional solicitado",
+            placeholder="Ej.: automatización extra, varias sedes o diseño avanzado",
+            key=f"{key_prefix}_scope",
+        )
+        submitted = st.form_submit_button(
+            "Enviar Solicitud de Cotización", type="primary"
+        )
+    if not submitted:
+        return None
+    try:
+        quote_request = solicitar_presupuesto_personalizado(
+            {
+                "customer_name": customer_name,
+                "customer_email": customer_email,
+                "business_name": submitted_business_name,
+                "scope": scope,
+                "prototype_id": prototype_id,
+            }
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
+    except RuntimeError as exc:
+        st.error(f"La solicitud quedó registrada, pero falló un envío: {exc}")
+        return None
+    except OSError as exc:
+        st.error(f"No se pudo guardar la solicitud de presupuesto: {exc}")
+        return None
+    return quote_request
+
+
+def approve_custom_quote(quote_id: str) -> None:
+    with STATE_LOCK:
+        state = load_state()
+        quote_request = next(
+            (item for item in state["quote_requests"] if item["id"] == quote_id),
+            None,
+        )
+        if quote_request is None:
+            raise ValueError("No se encontró la solicitud de presupuesto.")
+        if quote_request.get("status") == "approved":
+            raise ValueError("Este presupuesto ya fue aprobado.")
+        quote_request["status"] = "approved"
+        quote_request["approved_at"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        save_state(state)
+    enqueue_background_job(
+        f"Confirmación de presupuesto aprobado: {quote_request['business_name']}",
+        enviar_correo_cliente,
+        quote_request["customer_email"],
+        f"Presupuesto aprobado — {AGENCY_NAME}",
+        (
+            f"Hola, {quote_request['customer_name']}:\n\n"
+            "El CEO de Apex AI Agency aprobó la estimación adjunta como propuesta "
+            "económica para revisión. El trabajo solo comenzará después de aceptar "
+            "por escrito el alcance y completar los acuerdos de activación.\n\n"
+            f"{render_custom_quote(quote_request)}"
+        ),
+    )
 
 
 def notificar_compra_ceo(datos_compra: dict) -> dict:
@@ -437,51 +661,20 @@ def notificar_compra_ceo(datos_compra: dict) -> dict:
         state["contracts"].append(contract)
         save_state(state)
 
-    subject = (
-        f"💰 ¡NUEVA COMPRA EN {AGENCY_NAME.upper()}! - "
-        f"{notification['business_name']} ({amount_cents / 100:.0f} USD)"
-    )
-    body = (
-        (
-            "Pago marcado como verificado manualmente por el CEO.\n\n"
-            if payment_verified
-            else "Se recibió un reporte de pago/solicitud de activación; no implica "
-            "verificación automática de la transacción.\n\n"
-        )
-        + f"Negocio: {notification['business_name']}\n"
-        + f"Cliente: {notification['customer_name']}\n"
-        + f"Correo: {notification['customer_email']}\n"
-        + f"Pasarela: {method} — {amount_cents / 100:.0f} USD\n"
-        + f"Referencia: {notification['payment_reference'] or 'No indicada'}\n"
-        + f"Notas: {notification['notes'] or 'Ninguna'}\n"
-        + f"Nota de entrega solicitada: {'Sí' if notification['delivery_note_requested'] else 'No'}\n\n"
-        + (
-            "Se registró el importe en el libro de ingresos."
-            if payment_verified
-            else "Verifica el pago antes de actualizar el contrato."
-        )
-    )
-    enqueue_background_job(
-        f"Alerta de compra por correo: {notification['business_name']}",
-        enviar_correo_cliente,
-        SUPPORT_EMAIL,
-        subject,
-        body,
-    )
-    verification_message = (
-        "Pago verificado manualmente."
-        if payment_verified
-        else "Pago reportado, pendiente de verificación."
-    )
-    whatsapp_message = (
-        f"💰 ¡NUEVA COMPRA EN {AGENCY_NAME.upper()}! - {notification['business_name']} "
-        f"({amount_cents / 100:.0f} USD). {verification_message}"
-    )
-    enqueue_background_job(
-        f"Alerta de compra por WhatsApp: {notification['business_name']}",
-        notificar_ceo_whatsapp,
-        whatsapp_message,
-    )
+    purchase_details = {
+        "customer_name": notification["customer_name"],
+        "customer_email": notification["customer_email"],
+        "business_name": notification["business_name"],
+        "details": (
+            f"Pasarela: {method}\n"
+            f"Importe: {amount_cents / 100:.0f} USD\n"
+            f"Referencia: {notification['payment_reference'] or 'No indicada'}\n"
+            f"Estado del pago: "
+            f"{'verificado manualmente' if payment_verified else 'pendiente de verificación'}\n"
+            f"Notas: {notification['notes'] or 'Ninguna'}"
+        ),
+    }
+    enviar_alerta_ceo("new_purchase", purchase_details)
     if notification["delivery_note_requested"]:
         payment_message = (
             "Tu pago fue verificado. La Nota de Entrega Oficial se enviará cuando el "
@@ -503,6 +696,19 @@ def notificar_compra_ceo(datos_compra: dict) -> dict:
             notification["customer_email"],
             f"Solicitud recibida — {AGENCY_NAME}",
             acknowledgement,
+        )
+        enviar_alerta_ceo(
+            "delivery_note_request",
+            {
+                "customer_name": notification["customer_name"],
+                "customer_email": notification["customer_email"],
+                "business_name": notification["business_name"],
+                "details": (
+                    f"Referencia del pago: "
+                    f"{notification['payment_reference'] or 'No indicada'}\n"
+                    "El reporte permanece pendiente de verificación."
+                ),
+            },
         )
     return notification
 
@@ -552,15 +758,6 @@ def safe_text(value: str) -> str:
     return html.escape(value.strip(), quote=True)
 
 
-def ceo_whatsapp_digits() -> str:
-    try:
-        chat_id = str(st.secrets["CEO_WHATSAPP"]).strip()
-    except (KeyError, FileNotFoundError):
-        return ""
-    match = re.fullmatch(r"(\d+)@c\.us", chat_id)
-    return match.group(1) if match else ""
-
-
 def slugify(value: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return normalized or "prototipo"
@@ -579,7 +776,6 @@ def make_prototype_html(
     service: str,
     zone: str,
     payment_links: dict | None = None,
-    whatsapp_number: str = "",
     payment_options_open: bool = False,
     track_payment_open: bool = False,
 ) -> str:
@@ -606,16 +802,6 @@ def make_prototype_html(
                 f'${cents / 100:.0f} USD <small>Enlace pendiente de configurar</small></span>'
             )
     payment_options = "\n".join(payment_rows)
-    phone_digits = re.sub(r"\D", "", whatsapp_number)
-    whatsapp_button = ""
-    if phone_digits:
-        whatsapp_message = quote(
-            "Hola, acabo de ver el prototipo de mi negocio y quiero activarlo"
-        )
-        whatsapp_button = (
-            f'<a class="whatsapp-float" href="https://wa.me/{phone_digits}?text={whatsapp_message}" '
-            'target="_blank" rel="noopener noreferrer">💬 Hablar con un especialista por WhatsApp para activar</a>'
-        )
     payment_tracking_script = ""
     if track_payment_open:
         event_query = json.dumps(
@@ -658,8 +844,6 @@ def make_prototype_html(
       .payment-link{{display:block;border-radius:.7rem;background:#f5f5f4;padding:.75rem;color:#14532d;font-size:.88rem;font-weight:700;text-decoration:none}}
       .payment-link:hover{{background:#e7f2e9}}
       .payment-link small{{display:block;margin-top:.2rem;color:#78716c;font-weight:400}}
-      .whatsapp-float{{position:fixed;right:1.25rem;bottom:1.25rem;z-index:40;max-width:calc(100vw - 2.5rem);border-radius:999px;background:#15803d;padding:.9rem 1.2rem;color:white;font-size:.85rem;font-weight:700;text-align:center;text-decoration:none;box-shadow:0 8px 24px #0003}}
-      .whatsapp-float:hover{{background:#166534}}
       .simulator-card{{border:1px solid #e7e5e4;border-radius:1.25rem;background:#fff;padding:1.25rem}}
       .simulator-card input,.simulator-card select{{width:100%;border:1px solid #d6d3d1;border-radius:.65rem;padding:.7rem;margin:.35rem 0 .8rem}}
       .simulator-result{{border-radius:.75rem;background:#ecfdf5;padding:.9rem;color:#14532d;font-weight:700}}
@@ -744,7 +928,6 @@ def make_prototype_html(
       </section>
     </main>
     <footer class="border-t border-stone-200 px-6 py-6 text-center text-xs text-stone-500">© 2026 {business} · Concepto de demostración sin conexión de reservas · Vista creada por {AGENCY_NAME} · <a href="mailto:{support_email}">{support_email}</a></footer>
-    {whatsapp_button}
     <script>
       const nicheType = "{niche_type}";
       const services = nicheType === "clinic"
@@ -806,7 +989,6 @@ def create_prototypes(
             service,
             NICHES[niche]["zone"],
             payment_links,
-            ceo_whatsapp_digits(),
         )
         (folder / "index.html").write_text(html_content, encoding="utf-8")
         record = {
@@ -893,11 +1075,6 @@ def dispatch_approved_proposal(
             "No vuelvas a enviarla sin revisar el estado."
         ) from exc
 
-    enqueue_background_job(
-        f"Notificación de propuesta enviada a {business_name}",
-        notificar_ceo_whatsapp,
-        f"✅ Propuesta enviada automáticamente a {business_name}",
-    )
     return f"Correo enviado automáticamente a {business_name}."
 
 
@@ -940,7 +1117,7 @@ def proposal_phase_one(record: dict, demo_link: str) -> str:
         "cotizador instantáneo disponible 24/7. Preparamos un prototipo "
         "interactivo y personalizado para que lo prueben en vivo:\n"
         f"{demo_link}\n\n"
-        "¿Te gustaría que lo conectemos directo al WhatsApp de tu negocio esta semana?"
+        "¿Te gustaría que adaptemos el flujo de captación a tus canales de contacto esta semana?"
         f"\n\nUn saludo,\nEquipo de {AGENCY_NAME}\n{SUPPORT_EMAIL}"
     )
 
@@ -966,19 +1143,9 @@ def proposal_phase_two(record: dict, settings: dict) -> str:
     )
 
 
-def message_action_links(
-    record: dict,
-    message: str,
-    phase: str,
-    recipient_email: str,
-    recipient_phone: str,
-) -> tuple[str, str]:
-    phone_digits = re.sub(r"\D", "", recipient_phone)
-    whatsapp = f"https://wa.me/{phone_digits}" if phone_digits else "https://wa.me/"
-    whatsapp_url = f"{whatsapp}?{urlencode({'text': message})}"
-    email = quote(recipient_email.strip(), safe="@.+-_")
-    email_url = f"mailto:{email}?{urlencode({'subject': phase, 'body': message})}"
-    return whatsapp_url, email_url
+def email_action_link(message: str, subject: str, recipient_email: str) -> str:
+    email = recipient_email.strip()
+    return f"mailto:{email}?{urlencode({'subject': subject, 'body': message})}"
 
 
 def show_prototype_preview(
@@ -994,7 +1161,6 @@ def show_prototype_preview(
         record["service"],
         record["zone"],
         settings.get("payment_links", {}),
-        ceo_whatsapp_digits(),
     )
     share_url = public_demo_url(record, settings)
     col_preview, col_open, col_download = st.columns([1, 1, 1])
@@ -1079,14 +1245,7 @@ def render_factory_tab(state: dict) -> None:
                 label=f"Listo: {len(created)} prototipo(s) local(es) creados",
                 state="complete",
             )
-        enqueue_background_job(
-            "Notificación del lote de prototipos",
-            notificar_ceo_whatsapp,
-            f"🏭 Agentes terminaron {len(created)} prototipos. Entra a tu app para aprobarlos",
-        )
-        st.success(
-            f"{len(created)} prototipo(s) listo(s). La notificación al CEO quedó en cola."
-        )
+        st.success(f"{len(created)} prototipo(s) listo(s) para revisión.")
         st.rerun()
 
     st.divider()
@@ -1141,25 +1300,17 @@ def render_approval_tab(state: dict) -> None:
             if record.get("note"):
                 st.info(f"Nota de ajustes: {record['note']}")
             show_prototype_preview(record, key, state["settings"])
-            email_col, phone_col, save_col = st.columns([2, 2, 1])
+            email_col, save_col = st.columns([3, 1])
             with email_col:
                 recipient_email = st.text_input(
                     "Correo del prospecto",
                     value=record.get("contact_email", ""),
                     key=f"email_{key}",
                 )
-            with phone_col:
-                recipient_phone = st.text_input(
-                    "WhatsApp del prospecto (opcional)",
-                    value=record.get("contact_whatsapp", ""),
-                    key=f"phone_{key}",
-                    placeholder="+1 305 555 0100",
-                )
             with save_col:
                 st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                 if st.button("Guardar contacto", key=f"save_contact_{key}"):
                     record["contact_email"] = recipient_email.strip()
-                    record["contact_whatsapp"] = recipient_phone.strip()
                     save_state(state)
                     st.session_state["flash_message"] = (
                         f"Contacto guardado para {record['business_name']}."
@@ -1177,28 +1328,17 @@ def render_approval_tab(state: dict) -> None:
             with phase_one_tab:
                 phase_one_message = proposal_phase_one(record, demo_link)
                 st.code(phase_one_message, language="text")
-                wa_url, email_url = message_action_links(
-                    record,
+                email_url = email_action_link(
                     phase_one_message,
                     "Tu prototipo personalizado",
                     record.get("contact_email", ""),
-                    record.get("contact_whatsapp", ""),
                 )
-                whatsapp_col, email_col = st.columns(2)
-                with whatsapp_col:
-                    st.link_button(
-                        "Abrir WhatsApp — Mensaje 1 (Prototipo)",
-                        wa_url,
-                        disabled=not share_url,
-                        use_container_width=True,
-                    )
-                with email_col:
-                    st.link_button(
-                        "Abrir Correo — Mensaje 1 (Prototipo)",
-                        email_url,
-                        disabled=not share_url,
-                        use_container_width=True,
-                    )
+                st.link_button(
+                    "Abrir correo — Mensaje 1 (Prototipo)",
+                    email_url,
+                    disabled=not share_url or not recipient_email.strip(),
+                    use_container_width=True,
+                )
             with phase_two_tab:
                 phase_two_message = proposal_phase_two(record, state["settings"])
                 payment_ready = all(
@@ -1206,36 +1346,20 @@ def render_approval_tab(state: dict) -> None:
                     for url in state["settings"]["payment_links"].values()
                 )
                 st.code(phase_two_message, language="text")
-                wa_url, email_url = message_action_links(
-                    record,
+                email_url = email_action_link(
                     phase_two_message,
                     "Siguiente paso para activar su web",
                     record.get("contact_email", ""),
-                    record.get("contact_whatsapp", ""),
                 )
-                whatsapp_col, email_col = st.columns(2)
-                with whatsapp_col:
-                    st.link_button(
-                        "Abrir WhatsApp — Mensaje 2 (Links de Pago)",
-                        wa_url,
-                        disabled=not payment_ready,
-                        help=(
-                            None
-                            if record.get("contact_whatsapp", "").strip()
-                            else "WhatsApp se abrirá para que elijas el destinatario."
-                        ),
-                        use_container_width=True,
-                    )
-                with email_col:
-                    st.link_button(
-                        "Abrir Correo — Mensaje 2 (Links de Pago)",
-                        email_url,
-                        disabled=(
-                            not payment_ready
-                            or not record.get("contact_email", "").strip()
-                        ),
-                        use_container_width=True,
-                    )
+                st.link_button(
+                    "Abrir correo — Mensaje 2 (Links de Pago)",
+                    email_url,
+                    disabled=(
+                        not payment_ready
+                        or not record.get("contact_email", "").strip()
+                    ),
+                    use_container_width=True,
+                )
                 if not payment_ready:
                     st.caption(
                         "Configura las tres URLs oficiales de pago en la barra lateral "
@@ -1243,8 +1367,7 @@ def render_approval_tab(state: dict) -> None:
                     )
                 else:
                     st.caption(
-                        "Los botones abren un borrador en tu aplicación; revisa el contenido "
-                        "y envíalo manualmente. No se envían mensajes desde el dashboard."
+                        "El botón abre un borrador en tu aplicación. Revísalo y envíalo manualmente."
                     )
             if record.get("last_send_error"):
                 st.error(f"Último intento: {record['last_send_error']}")
@@ -1266,7 +1389,6 @@ def render_approval_tab(state: dict) -> None:
                         )
                     else:
                         record["contact_email"] = recipient_email.strip()
-                        record["contact_whatsapp"] = recipient_phone.strip()
                         record["status"] = "sending"
                         record.pop("last_send_error", None)
                         save_state(state)
@@ -1505,6 +1627,58 @@ def render_finance_tab(state: dict) -> None:
                             f"Venta verificada registrada para {sale_business.strip()}."
                         )
                         st.rerun()
+    with st.expander("Solicitar Presupuesto a la Medida"):
+        quote_request = render_quote_request_form(
+            "Cliente prospecto",
+            "",
+            "ceo_quote_request",
+        )
+        if quote_request:
+            st.success(
+                f"Solicitud guardada. Estimación: "
+                f"{money(quote_request['total_cents'])}; enviada al cliente y al CEO "
+                "para revisión y aprobación."
+            )
+    if state["quote_requests"]:
+        st.markdown("#### Solicitudes de presupuesto para seguimiento")
+        for quote_request in state["quote_requests"][:20]:
+            with st.container(border=True):
+                title_col, amount_col = st.columns([3, 1])
+                with title_col:
+                    st.markdown(
+                        f"**{quote_request['business_name']}** · "
+                        f"{quote_request['customer_name']}"
+                    )
+                    st.caption(
+                        f"{quote_request['customer_email']} · "
+                        f"{quote_request['created_at']}"
+                    )
+                    st.write(quote_request["scope"])
+                    st.caption(
+                        " · ".join(
+                            f"{item['description']}: {money(item['amount_cents'])}"
+                            for item in quote_request["line_items"]
+                        )
+                    )
+                with amount_col:
+                    st.metric("Estimación", money(quote_request["total_cents"]))
+                    if quote_request.get("status") == "approved":
+                        st.success("Aprobado")
+                    elif st.button(
+                        "Aprobar presupuesto",
+                        key=f"approve_quote_{quote_request['id']}",
+                        type="primary",
+                    ):
+                        try:
+                            approve_custom_quote(quote_request["id"])
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            st.error(f"No se pudo aprobar el presupuesto: {exc}")
+                        else:
+                            st.session_state["flash_message"] = (
+                                f"Presupuesto aprobado para "
+                                f"{quote_request['business_name']}."
+                            )
+                            st.rerun()
     for contract in state["contracts"]:
         contract_id = contract.get("id") or uuid.uuid4().hex
         contract["id"] = contract_id
@@ -1574,7 +1748,7 @@ def render_finance_tab(state: dict) -> None:
                     "Detalle de la Nota de Entrega para el cliente",
                     value=contract.get(
                         "delivery_details",
-                        "Sistema de Captación Web\nCotizador IA\nIntegración WhatsApp",
+                        "Sistema de Captación Web\nCotizador IA\nIntegración con canales de contacto",
                     ),
                     key=f"contract_delivery_details_{contract_id}",
                 )
@@ -1788,18 +1962,6 @@ def render_sidebar_settings(state: dict) -> None:
         st.caption(
             "Los mensajes salen solo tras acciones explícitas; los pagos no se procesan aquí."
         )
-        if st.button(
-            "🔔 Probar Notificación a mi WhatsApp",
-            use_container_width=True,
-        ):
-            enqueue_background_job(
-                "Prueba de notificación Green-API",
-                notificar_ceo_whatsapp,
-                "🔔 Prueba de conexión del CEO Command Center: Green-API está configurada.",
-            )
-            st.success("Prueba enviada a la cola; revisa el estado abajo.")
-
-
 @st.fragment(run_every="2s")
 def render_background_jobs() -> None:
     with BACKGROUND_JOBS_LOCK:
@@ -1843,6 +2005,29 @@ def render_background_jobs() -> None:
                 refresh_app = refresh_app or job["kind"] == "approval"
         elif job["status"] == "queued" and future.running():
             job["status"] = "running"
+        if job["status"] in ("succeeded", "warning", "failed") and job["kind"] == "ceo_alert":
+            with STATE_LOCK:
+                state = load_state()
+                alert = next(
+                    (
+                        item
+                        for item in state["activity_alerts"]
+                        if item.get("id") == job["record_id"]
+                    ),
+                    None,
+                )
+                if alert:
+                    alert["status"] = (
+                        "email_sent"
+                        if job["status"] == "succeeded"
+                        else "email_failed"
+                    )
+                    if job["status"] != "succeeded":
+                        alert["email_error"] = (
+                            job.get("error") or job.get("warning", "Error de envío")
+                        )
+                    save_state(state)
+            refresh_app = True
 
     with BACKGROUND_JOBS_LOCK:
         visible_jobs = list(BACKGROUND_JOBS.values())[-10:]
@@ -1862,9 +2047,10 @@ def render_background_jobs() -> None:
 
 
 def render_recent_purchase_notifications(state: dict) -> None:
-    st.markdown("### 🔔 Notificaciones de Compras Recientes")
-    recent = state["purchase_notifications"][:8]
-    if not recent:
+    st.markdown("### 🔔 Alertas y Actividad Reciente")
+    alerts = state["activity_alerts"][:8]
+    purchases = state["purchase_notifications"][:8]
+    if not alerts and not purchases and not state["quote_requests"]:
         with st.container(border=True):
             icon_col, message_col = st.columns([1, 8])
             with icon_col:
@@ -1875,10 +2061,54 @@ def render_recent_purchase_notifications(state: dict) -> None:
             with message_col:
                 st.markdown("**Tu actividad empieza aquí**")
                 st.caption(
-                    "Aún no hay reportes de compra. Lanza tu primera operación desde "
-                    "la pestaña «Lanzar Operación» y las notificaciones aparecerán aquí."
+                    "Aún no hay alertas ni solicitudes. Lanza tu primera operación "
+                    "o envía una solicitud de presupuesto para iniciar el seguimiento."
                 )
         return
+    if alerts:
+        st.markdown("**Alertas por correo**")
+        for alert in alerts:
+            with st.container(border=True):
+                left, right = st.columns([4, 1])
+                with left:
+                    st.markdown(
+                        f"**{alert.get('event_label', 'Actividad')}** · "
+                        f"{alert.get('business_name', 'Negocio')}"
+                    )
+                    st.caption(
+                        f"{alert.get('created_at', '')} · "
+                        f"{alert.get('customer_name', 'Cliente')} · "
+                        f"{alert.get('customer_email') or 'Correo no indicado'}"
+                    )
+                    if alert.get("details"):
+                        st.caption(alert["details"])
+                with right:
+                    status = alert.get("status", "email_queued")
+                    if status in ("email_queued", "queued", "running"):
+                        st.info("Correo en cola")
+                    elif status == "email_sent":
+                        st.success("Correo enviado")
+                    else:
+                        st.warning(
+                            f"Envío pendiente de revisión: "
+                            f"{alert.get('email_error', 'error no especificado')}"
+                        )
+    if state["quote_requests"]:
+        st.markdown("**Presupuestos personalizados**")
+        for quote_request in state["quote_requests"][:5]:
+            status = (
+                "Aprobado por el CEO"
+                if quote_request.get("status") == "approved"
+                else "Pendiente de aprobación"
+            )
+            st.caption(
+                f"{quote_request['created_at']} · {quote_request['business_name']} · "
+                f"{money(quote_request['total_cents'])} · {status}"
+            )
+    if not purchases:
+        return
+    st.markdown("**Reportes de pago y activación**")
+    recent = purchases
     for notification in recent:
         verified = notification.get("status") == "verified"
         status_text = "Pago verificado manualmente" if verified else "Pendiente de verificación"
@@ -1935,11 +2165,6 @@ def render_demo_view(
         unsafe_allow_html=True,
     )
     st.title(f"Vista previa exclusiva para {record['business_name']}")
-    if not ceo_whatsapp_digits():
-        st.warning(
-            "El contacto de WhatsApp del especialista no está disponible; "
-            "configura CEO_WHATSAPP en Streamlit secrets."
-        )
     st.caption(
         "Concepto de demostración. La activación requiere aprobación explícita, "
         "configuración de enlaces y publicación autorizada."
@@ -1950,7 +2175,6 @@ def render_demo_view(
             record["service"],
             record["zone"],
             state["settings"].get("payment_links", {}),
-            ceo_whatsapp_digits(),
             payment_options_open=payment_options_open,
             track_payment_open=not payment_options_open,
         ),
@@ -2017,6 +2241,20 @@ def render_demo_view(
             "oficial se enviará cuando el sistema esté entregado y activo."
         )
 
+    with st.container(border=True):
+        quote_request = render_quote_request_form(
+            record["business_name"],
+            record["id"],
+            f"public_quote_{record['id']}",
+        )
+        if quote_request:
+            st.session_state[f"quote_confirmation_{record['id']}"] = quote_request["id"]
+    if st.session_state.get(f"quote_confirmation_{record['id']}"):
+        st.success(
+            "La solicitud de presupuesto fue registrada y la estimación se envió "
+            "para revisión. La propuesta definitiva requiere aprobación expresa."
+        )
+
     st.subheader("Preguntas frecuentes")
     for question, answer in (
         (
@@ -2024,8 +2262,8 @@ def render_demo_view(
             "La activación se coordina en un plazo estimado de 24 horas tras confirmar el pago y los accesos necesarios.",
         ),
         (
-            "¿Funciona con mi número actual de WhatsApp y mi dominio?",
-            "Sí. Se puede configurar para integrarse con tu número y dominio actuales; la configuración final se confirma al activar el proyecto.",
+            "¿Funciona con mis canales de contacto actuales y mi dominio?",
+            "Sí. Se puede configurar para integrarse con tus canales de contacto y dominio actuales; la configuración final se confirma al activar el proyecto.",
         ),
         (
             "¿Puedo solicitar Nota de Entrega o comprobante corporativo?",
@@ -2160,23 +2398,6 @@ def main() -> None:
         if demo_record is None:
             st.error("No se encontró una demo con ese identificador.")
             st.stop()
-        if (
-            not payments_opened
-            and st.session_state.get("notified_demo_open") != demo_record["id"]
-        ):
-            st.session_state["notified_demo_open"] = demo_record["id"]
-            enqueue_background_job(
-                f"Alerta de apertura de demo: {demo_record['business_name']}",
-                notificar_ceo_whatsapp,
-                f"👀 ¡Alerta CEO! El negocio {demo_record['business_name']} acaba de abrir su prototipo en vivo",
-            )
-        if payments_opened and st.session_state.get("notified_payments_open") != demo_record["id"]:
-            st.session_state["notified_payments_open"] = demo_record["id"]
-            enqueue_background_job(
-                f"Opciones de pago abiertas: {demo_record['business_name']}",
-                notificar_ceo_whatsapp,
-                f"💳 ¡Alerta CEO! El negocio {demo_record['business_name']} desplegó las opciones de pago de su prototipo",
-            )
         render_demo_view(demo_record, state, payments_opened)
         st.stop()
 
