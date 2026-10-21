@@ -1,3 +1,7 @@
 .streamlit/secrets.toml
 .ceo_dashboard/
 __pycache__/
+
+# Prospect contact data and generated exports
+apex_scraper/prospectos_apex*.db
+apex_scraper/leads_*.csv

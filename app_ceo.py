@@ -3,10 +3,14 @@ from __future__ import annotations
 import html
 import hmac
 import json
+import os
 import re
 import shutil
 import smtplib
+import sqlite3
 import ssl
+import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -19,10 +23,29 @@ from email.utils import parseaddr
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, urlunparse
 
+import requests
 import streamlit as st
 
 
 ROOT = Path(__file__).resolve().parent
+configured_leads_db = Path(
+    os.environ.get(
+        "APEX_LEADS_DB_PATH",
+        str(ROOT / "apex_scraper" / "prospectos_apex_scraping.db"),
+    )
+).expanduser()
+LEADS_DB_PATH = (
+    configured_leads_db
+    if configured_leads_db.is_absolute()
+    else ROOT / configured_leads_db
+).resolve()
+SCRAPER_DIR = ROOT / "apex_scraper"
+SCRAPER_DB_PATH = SCRAPER_DIR / "prospectos_apex_scraping.db"
+LEAD_FUNNEL_STAGES = {
+    "CONTACTADO_FASE_1",
+    "PROPUESTA_PAGO_ENVIADA",
+    "CLIENTE_CERRADO",
+}
 PENDING_DIR = ROOT / "02_BANDEJA_APROBACION" / "pendientes"
 APPROVED_DIR = ROOT / "02_BANDEJA_APROBACION" / "aprobados"
 DATA_DIR = ROOT / ".ceo_dashboard"
@@ -114,6 +137,436 @@ def pending_prototype_count(state: dict) -> int:
         record.get("status") in ("pending", "changes_requested")
         for record in state["prototypes"]
     )
+
+
+def leads_db_display_path() -> str:
+    try:
+        return str(LEADS_DB_PATH.relative_to(ROOT))
+    except ValueError:
+        return str(LEADS_DB_PATH)
+
+
+def normalize_search_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
+    return "".join(character for character in normalized if not unicodedata.combining(character))
+
+
+def is_financial_business(name: str, web: str, market: str) -> bool:
+    searchable = normalize_search_text(f"{name} {web} {market}")
+    return any(
+        term in searchable
+        for term in (
+            "bancrecer",
+            "banco",
+            "bank",
+            "fintech",
+            "credito",
+            "bancario",
+            "financial",
+            "finance",
+        )
+    )
+
+
+def clean_lead_email(value: str) -> str:
+    invalid_values = {"", "pendiente", "no detectado", "no disponible", "none", "null"}
+    for candidate in re.split(r"[,;\s]+", str(value or "")):
+        email = candidate.strip()
+        if (
+            email.casefold() not in invalid_values
+            and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+        ):
+            return email
+    return ""
+
+
+def clean_lead_phone(value: str) -> str:
+    invalid_values = {"", "pendiente", "no detectado", "no disponible", "none", "null"}
+    for candidate in re.split(r"[,;]+", str(value or "")):
+        phone = candidate.strip()
+        if phone.casefold() in invalid_values:
+            continue
+        if sum(character.isdigit() for character in phone) >= 7:
+            return phone
+    return ""
+
+
+def _open_leads_database(read_only: bool = True) -> sqlite3.Connection:
+    if not LEADS_DB_PATH.is_file():
+        raise FileNotFoundError(
+            f"No se encontró la base de prospectos: {leads_db_display_path()}."
+        )
+    if read_only:
+        connection = sqlite3.connect(
+            f"{LEADS_DB_PATH.as_uri()}?mode=ro", uri=True, timeout=10
+        )
+    else:
+        connection = sqlite3.connect(LEADS_DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 10000")
+    return connection
+
+
+def load_prospect_data() -> tuple[dict[str, int], list[dict]]:
+    try:
+        connection = _open_leads_database()
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"No se pudo abrir la base de prospectos "
+            f"{leads_db_display_path()}: {exc}"
+        ) from exc
+    try:
+        connection.execute("BEGIN")
+        stats_row = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN UPPER(COALESCE(estado, '')) LIKE 'ALTA%' THEN 1 ELSE 0 END) AS high_priority,
+                SUM(CASE WHEN UPPER(COALESCE(estado, '')) LIKE 'MEDIA%' THEN 1 ELSE 0 END) AS medium_priority
+            FROM leads_scraping
+            """
+        ).fetchone()
+        rows = connection.execute(
+            """
+            SELECT id, nombre, direccion, telefono, web, mercado, estado, email
+            FROM leads_scraping
+            ORDER BY nombre COLLATE NOCASE
+            """
+        ).fetchall()
+        has_proposal_tracking = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'lead_proposals'
+            """
+        ).fetchone()
+        if has_proposal_tracking:
+            tracking_columns = {
+                column["name"]
+                for column in connection.execute(
+                    "PRAGMA table_info(lead_proposals)"
+                ).fetchall()
+            }
+            priority_column = (
+                "priority_status"
+                if "priority_status" in tracking_columns
+                else "'' AS priority_status"
+            )
+            tracking_rows = connection.execute(
+                f"""
+                SELECT lead_id, status, {priority_column}, updated_at
+                FROM lead_proposals
+                ORDER BY updated_at, rowid
+                """
+            ).fetchall()
+        else:
+            tracking_rows = []
+        connection.commit()
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise RuntimeError(
+            f"No se pudo consultar la tabla leads_scraping en "
+            f"{leads_db_display_path()}: {exc}"
+        ) from exc
+    finally:
+        connection.close()
+
+    tracked_by_lead: dict[int, dict] = {}
+    for tracking_row in tracking_rows:
+        tracked_by_lead[int(tracking_row["lead_id"])] = dict(tracking_row)
+
+    qualified_leads = []
+    high_priority_count = 0
+    medium_priority_count = 0
+    contacted_count = 0
+    closing_count = 0
+    closed_count = 0
+    for row in rows:
+        lead = dict(row)
+        lead["email"] = clean_lead_email(lead["email"])
+        lead["telefono"] = clean_lead_phone(lead["telefono"])
+        if is_financial_business(
+            lead["nombre"], lead["web"], lead["mercado"]
+        ):
+            continue
+        if not lead["email"] and not lead["telefono"]:
+            continue
+        tracked = tracked_by_lead.get(int(lead["id"]), {})
+        raw_status = str(lead["estado"] or "")
+        priority_status = str(tracked.get("priority_status") or "")
+        if raw_status.upper().startswith(("ALTA", "MEDIA")):
+            priority_status = raw_status
+        funnel_status = str(tracked.get("status") or "")
+        if raw_status in LEAD_FUNNEL_STAGES and funnel_status not in LEAD_FUNNEL_STAGES:
+            funnel_status = raw_status
+        if not priority_status.upper().startswith(("ALTA", "MEDIA")):
+            continue
+        lead["prioridad"] = priority_status
+        lead["funnel_status"] = funnel_status or "SIN CONTACTAR"
+        if priority_status.upper().startswith("ALTA"):
+            high_priority_count += 1
+        elif priority_status.upper().startswith("MEDIA"):
+            medium_priority_count += 1
+        if lead["funnel_status"] == "CONTACTADO_FASE_1":
+            contacted_count += 1
+        elif lead["funnel_status"] == "PROPUESTA_PAGO_ENVIADA":
+            closing_count += 1
+        elif lead["funnel_status"] == "CLIENTE_CERRADO":
+            closed_count += 1
+        qualified_leads.append(lead)
+
+    stats = {
+        "total": int(stats_row["total"] or 0),
+        "clean": len(qualified_leads),
+        "high_priority": high_priority_count,
+        "medium_priority": medium_priority_count,
+        "qualified": len(qualified_leads),
+        "contacted_phase_one": contacted_count,
+        "payment_proposal_sent": closing_count,
+        "closed_clients": closed_count,
+    }
+    return stats, qualified_leads
+
+
+def update_lead_proposal_status(
+    lead_id: int, proposal_id: str, status: str, business_name: str
+) -> None:
+    try:
+        connection = _open_leads_database(read_only=False)
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"No se pudo abrir la base para registrar la propuesta: {exc}"
+        ) from exc
+    try:
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lead_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    lead_id INTEGER NOT NULL,
+                    business_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    priority_status TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            tracking_columns = {
+                column["name"]
+                for column in connection.execute(
+                    "PRAGMA table_info(lead_proposals)"
+                ).fetchall()
+            }
+            if "priority_status" not in tracking_columns:
+                connection.execute(
+                    "ALTER TABLE lead_proposals ADD COLUMN "
+                    "priority_status TEXT NOT NULL DEFAULT ''"
+                )
+            lead_row = connection.execute(
+                "SELECT estado FROM leads_scraping WHERE id = ?", (lead_id,)
+            ).fetchone()
+            if lead_row is None:
+                raise ValueError(f"No existe el lead SQLite con ID {lead_id}.")
+            existing_tracking = connection.execute(
+                """
+                SELECT priority_status FROM lead_proposals
+                WHERE proposal_id = ?
+                """,
+                (proposal_id,),
+            ).fetchone()
+            current_status = str(lead_row["estado"] or "")
+            priority_status = (
+                current_status
+                if current_status.upper().startswith(("ALTA", "MEDIA"))
+                else (
+                    str(existing_tracking["priority_status"] or "")
+                    if existing_tracking
+                    else ""
+                )
+            )
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                INSERT INTO lead_proposals
+                    (proposal_id, lead_id, business_name, status, created_at,
+                     updated_at, priority_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    priority_status = CASE
+                        WHEN excluded.priority_status != ''
+                        THEN excluded.priority_status
+                        ELSE lead_proposals.priority_status
+                    END
+                """,
+                (
+                    proposal_id,
+                    lead_id,
+                    business_name,
+                    status,
+                    now,
+                    now,
+                    priority_status,
+                ),
+            )
+            connection.execute(
+                "UPDATE leads_scraping SET estado = ? WHERE id = ?",
+                (status, lead_id),
+            )
+            if status == "CLIENTE_CERRADO":
+                connection.execute(
+                    """
+                    UPDATE lead_proposals
+                    SET status = ?, updated_at = ?
+                    WHERE lead_id = ?
+                    """,
+                    (status, now, lead_id),
+                )
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"No se pudo registrar el seguimiento de la propuesta del lead "
+            f"{lead_id} en SQLite: {exc}"
+        ) from exc
+    finally:
+        connection.close()
+
+
+def mark_matching_leads_as_closed(business_name: str, customer_email: str) -> int:
+    try:
+        connection = _open_leads_database(read_only=True)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"No se pudo abrir la base para cerrar el lead: {exc}") from exc
+    try:
+        matches = connection.execute(
+            "SELECT id, nombre, email FROM leads_scraping"
+        ).fetchall()
+        has_tracking = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'lead_proposals'
+            """
+        ).fetchone()
+        lead_matches = []
+        normalized_business = normalize_search_text(business_name)
+        normalized_email = customer_email.strip().casefold()
+        for lead in matches:
+            emails = {
+                item.strip().casefold()
+                for item in re.split(r"[,;]+", str(lead["email"] or ""))
+                if "@" in item
+            }
+            if (
+                (normalized_business and normalize_search_text(lead["nombre"]) == normalized_business)
+                or (normalized_email and normalized_email in emails)
+            ):
+                lead_matches.append(
+                    {
+                        "id": int(lead["id"]),
+                        "nombre": str(lead["nombre"] or business_name),
+                    }
+                )
+        proposals_by_lead: dict[int, str] = {}
+        if has_tracking and lead_matches:
+            placeholders = ",".join("?" for _ in lead_matches)
+            tracking_rows = connection.execute(
+                f"""
+                SELECT lead_id, proposal_id, updated_at
+                FROM lead_proposals
+                WHERE lead_id IN ({placeholders})
+                ORDER BY updated_at
+                """,
+                tuple(lead["id"] for lead in lead_matches),
+            ).fetchall()
+            for tracking in tracking_rows:
+                proposals_by_lead[int(tracking["lead_id"])] = str(
+                    tracking["proposal_id"]
+                )
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"No se pudieron buscar leads para cerrar: {exc}") from exc
+    finally:
+        connection.close()
+
+    for lead in lead_matches:
+        proposal_id = proposals_by_lead.get(lead["id"]) or (
+            f"closed-sale-{lead['id']}-{uuid.uuid4().hex[:8]}"
+        )
+        update_lead_proposal_status(
+            lead["id"],
+            proposal_id,
+            "CLIENTE_CERRADO",
+            lead["nombre"],
+        )
+    return len(lead_matches)
+
+
+def backup_leads_database() -> Path:
+    backup_dir = DATA_DIR / "database_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / (
+        f"prospectos_apex_scraping_before_purge_"
+        f"{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')}.db"
+    )
+    source = _open_leads_database(read_only=True)
+    destination = sqlite3.connect(backup_path, timeout=10)
+    try:
+        source.backup(destination)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"No se pudo crear respaldo antes de la purga: {exc}") from exc
+    finally:
+        destination.close()
+        source.close()
+    return backup_path
+
+
+def run_scraper_script(script_name: str) -> dict:
+    allowed_scripts = {
+        "extractor.py",
+        "enriquecedor.py",
+        "limpiar_bancos.py",
+        "cualificador.py",
+    }
+    if script_name not in allowed_scripts:
+        raise ValueError("Script de prospección no autorizado.")
+    script_path = SCRAPER_DIR / script_name
+    if not script_path.is_file():
+        raise FileNotFoundError(f"No se encontró el motor: {script_path.name}.")
+    if LEADS_DB_PATH.resolve() != SCRAPER_DB_PATH.resolve():
+        raise RuntimeError(
+            "Los motores actuales usan la base local de apex_scraper. Ajusta "
+            "APEX_LEADS_DB_PATH a esa ruta antes de ejecutarlos."
+        )
+    backup_path = ""
+    if script_name == "limpiar_bancos.py":
+        backup_path = str(backup_leads_database())
+    completed = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=SCRAPER_DIR,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "script": script_name,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout[-12000:],
+        "stderr": completed.stderr[-12000:],
+        "backup_path": backup_path,
+    }
+
+
+def run_scraper_pipeline() -> dict:
+    steps = []
+    for script_name in (
+        "extractor.py",
+        "enriquecedor.py",
+        "limpiar_bancos.py",
+        "cualificador.py",
+    ):
+        result = run_scraper_script(script_name)
+        steps.append(result)
+        if result["returncode"] != 0:
+            return {"returncode": result["returncode"], "steps": steps}
+    return {"returncode": 0, "steps": steps}
 
 
 def default_state() -> dict:
@@ -661,6 +1114,28 @@ def notificar_compra_ceo(datos_compra: dict) -> dict:
         state["contracts"].append(contract)
         save_state(state)
 
+    if payment_verified:
+        try:
+            notification["matched_leads"] = mark_matching_leads_as_closed(
+                notification["business_name"],
+                notification["customer_email"],
+            )
+        except RuntimeError as exc:
+            notification["lead_sync_error"] = str(exc)
+            with STATE_LOCK:
+                state = load_state()
+                saved_notification = next(
+                    (
+                        item
+                        for item in state["purchase_notifications"]
+                        if item.get("id") == notification["id"]
+                    ),
+                    None,
+                )
+                if saved_notification:
+                    saved_notification["lead_sync_error"] = str(exc)
+                    save_state(state)
+
     purchase_details = {
         "customer_name": notification["customer_name"],
         "customer_email": notification["customer_email"],
@@ -671,6 +1146,7 @@ def notificar_compra_ceo(datos_compra: dict) -> dict:
             f"Referencia: {notification['payment_reference'] or 'No indicada'}\n"
             f"Estado del pago: "
             f"{'verificado manualmente' if payment_verified else 'pendiente de verificación'}\n"
+            f"Leads cerrados en SQLite: {notification.get('matched_leads', 0)}\n"
             f"Notas: {notification['notes'] or 'Ninguna'}"
         ),
     }
@@ -1083,6 +1559,146 @@ def create_prototypes(
     return created
 
 
+def generate_proposal_copy_with_ai(
+    lead: dict, api_key: str, model: str = "gpt-4o-mini"
+) -> tuple[str, str]:
+    prompt = (
+        "Redacta en español un primer correo B2B breve, humano y personalizado para "
+        "un negocio local. Devuelve únicamente un objeto JSON con las claves "
+        "'subject' y 'body'. Menciona una oportunidad para mejorar la captación sin "
+        "afirmar que auditaste el sitio ni inventar problemas o resultados. Invita a "
+        "probar un prototipo interactivo e incluye exactamente el marcador "
+        "{{DEMO_LINK}} en una línea propia. No incluyas precios, pagos ni promesas "
+        "de resultados. Termina con una pregunta sencilla sobre conectar el flujo "
+        "a WhatsApp. Firma como Apex AI Agency y añade hello.apexrepurposing@gmail.com."
+    )
+    business_context = {
+        "business_name": lead["nombre"],
+        "market": lead.get("mercado") or "",
+        "location": lead.get("direccion") or "",
+        "website": lead.get("web") or "",
+    }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(business_context, ensure_ascii=False),
+                    },
+                ],
+                "temperature": 0.5,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload["choices"][0]["message"]["content"]
+        generated = json.loads(content)
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"No se pudo contactar al proveedor de IA ({type(exc).__name__})."
+        ) from exc
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "El proveedor de IA devolvió una respuesta inválida; no se creó el borrador."
+        ) from exc
+
+    if not isinstance(generated, dict):
+        raise RuntimeError(
+            "El proveedor de IA devolvió una respuesta inválida; no se creó el borrador."
+        )
+    subject_value = generated.get("subject")
+    body_value = generated.get("body")
+    if not isinstance(subject_value, str) or not isinstance(body_value, str):
+        raise RuntimeError(
+            "La respuesta de IA no incluyó asunto y cuerpo de texto válidos."
+        )
+    subject = subject_value.strip()
+    body = body_value.strip()
+    if (
+        not subject
+        or len(subject) > 180
+        or "\n" in subject
+        or "\r" in subject
+        or not body
+        or len(body) > 5000
+        or "{{DEMO_LINK}}" not in body
+    ):
+        raise RuntimeError(
+            "La respuesta de IA no incluyó asunto, cuerpo y marcador de demo válidos."
+        )
+    if SUPPORT_EMAIL not in body:
+        body = f"{body.rstrip()}\n\nEquipo de {AGENCY_NAME}\n{SUPPORT_EMAIL}"
+    return subject, body
+
+
+def generate_and_store_lead_proposal(
+    lead: dict, api_key: str, model: str, payment_links: dict
+) -> str | None:
+    subject, message = generate_proposal_copy_with_ai(lead, api_key, model)
+    proposal_id = (
+        f"{slugify(lead['nombre'])}-lead-{lead['id']}-{uuid.uuid4().hex[:8]}"
+    )
+    folder = PENDING_DIR / proposal_id
+    folder.mkdir(parents=False, exist_ok=False)
+    zone = str(lead.get("direccion") or lead.get("mercado") or "Zona por confirmar")
+    service = str(lead.get("mercado") or "Negocio local")
+    record = {
+        "id": proposal_id,
+        "lead_id": int(lead["id"]),
+        "business_name": str(lead["nombre"]),
+        "service": service,
+        "niche": "Prospección SQLite",
+        "zone": zone,
+        "objective": "Borrador generado con IA desde la base local de prospectos.",
+        "status": "pending",
+        "note": "",
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "folder": str(folder.relative_to(ROOT)),
+        "contact_email": clean_lead_email(lead.get("email", "")),
+        "proposal_subject": subject,
+        "proposal_message": message,
+    }
+    try:
+        (folder / "index.html").write_text(
+            make_prototype_html(
+                record["business_name"],
+                record["service"],
+                record["zone"],
+                payment_links,
+            ),
+            encoding="utf-8",
+        )
+        (folder / "proposal.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        with STATE_LOCK:
+            state = load_state()
+            state["prototypes"].append(record)
+            save_state(state)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Se generó el contenido, pero no se pudo guardar íntegramente "
+            f"la propuesta de {record['business_name']}: {exc}"
+        ) from exc
+    try:
+        update_lead_proposal_status(
+            int(lead["id"]), proposal_id, "pending_approval", record["business_name"]
+        )
+    except RuntimeError as exc:
+        return (
+            f"El borrador está en la bandeja de aprobación, pero no se pudo actualizar "
+            f"su seguimiento SQLite: {exc}"
+        )
+    return None
+
+
 def safe_prototype_folder(record: dict, expected_parent: Path) -> Path:
     folder = (ROOT / record["folder"]).resolve()
     if folder.parent != expected_parent.resolve() or not folder.is_dir():
@@ -1112,8 +1728,32 @@ class EmailSentArchiveError(RuntimeError):
 
 def dispatch_approved_proposal(
     record_id: str, recipient: str, subject: str, body: str
-) -> str:
+) -> str | None:
+    current_state = load_state()
+    record = next(
+        (
+            item
+            for item in current_state["prototypes"]
+            if item.get("id") == record_id
+        ),
+        None,
+    )
+    if record is None or record.get("status") != "sending":
+        raise ValueError("La propuesta no está en estado de envío aprobado.")
     enviar_correo_cliente(recipient, subject, body)
+    funnel_warning = ""
+    if record and record.get("lead_id") is not None:
+        try:
+            update_lead_proposal_status(
+                int(record["lead_id"]),
+                record_id,
+                "CONTACTADO_FASE_1",
+                record["business_name"],
+            )
+        except (RuntimeError, ValueError) as exc:
+            funnel_warning = (
+                f"El correo Fase 1 se envió, pero falló la sincronización SQLite: {exc}"
+            )
     try:
         with STATE_LOCK:
             state = load_state()
@@ -1148,7 +1788,52 @@ def dispatch_approved_proposal(
             "No vuelvas a enviarla sin revisar el estado."
         ) from exc
 
-    return f"Correo enviado automáticamente a {business_name}."
+    return funnel_warning or None
+
+
+def dispatch_phase_two_proposal(
+    record_id: str, recipient: str, subject: str, body: str
+) -> str | None:
+    enviar_correo_cliente(recipient, subject, body)
+    warning = ""
+    with STATE_LOCK:
+        state = load_state()
+        record = next(
+            (item for item in state["prototypes"] if item.get("id") == record_id),
+            None,
+        )
+        if record is None:
+            return (
+                "El correo Fase 2 se envió, pero no se encontró el registro local "
+                "para guardar el seguimiento."
+            )
+        record["phase_two_sent_at"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        record["phase_two_recipient"] = recipient
+        try:
+            save_state(state)
+        except OSError as exc:
+            warning = (
+                f"El correo Fase 2 se envió, pero no se pudo guardar su historial "
+                f"local: {exc}"
+            )
+        lead_id = record.get("lead_id")
+        business_name = record["business_name"]
+    if lead_id is not None:
+        try:
+            update_lead_proposal_status(
+                int(lead_id),
+                record_id,
+                "PROPUESTA_PAGO_ENVIADA",
+                business_name,
+            )
+        except (RuntimeError, ValueError) as exc:
+            sync_warning = (
+                f"El correo Fase 2 se envió, pero falló la sincronización SQLite: {exc}"
+            )
+            warning = f"{warning} {sync_warning}".strip()
+    return warning or None
 
 
 def register_change_request(state: dict, record: dict, note: str) -> None:
@@ -1172,17 +1857,19 @@ def public_demo_url(record: dict, settings: dict) -> str:
     return urlunparse(
         parsed._replace(
             path=parsed.path or "/",
-            query=urlencode({"demo": record["business_name"]}),
+            query=urlencode({"demo": record["id"]}),
             fragment="",
         )
     )
 
 
 def local_demo_url(record: dict) -> str:
-    return f"http://127.0.0.1:8501/?{urlencode({'demo': record['business_name']})}"
+    return f"http://127.0.0.1:8501/?{urlencode({'demo': record['id']})}"
 
 
 def proposal_phase_one(record: dict, demo_link: str) -> str:
+    if record.get("proposal_message"):
+        return str(record["proposal_message"]).replace("{{DEMO_LINK}}", demo_link)
     return (
         f"Hola, equipo de {record['business_name']}:\n\n"
         f"Analizamos oportunidades de captación para negocios de {record['zone']} "
@@ -1340,6 +2027,290 @@ def render_factory_tab(state: dict) -> None:
             )
 
 
+def render_prospecting_tab(state: dict) -> None:
+    st.subheader("Prospección comercial desde SQLite")
+    st.caption(
+        f"Fuente: `{leads_db_display_path()}`. La consulta es de solo lectura "
+        "para leads; los borradores y su seguimiento se guardan aparte."
+    )
+    try:
+        stats, leads = load_prospect_data()
+    except (FileNotFoundError, RuntimeError) as exc:
+        st.error(f"No se pudieron cargar los prospectos: {exc}")
+        return
+
+    render_scraper_controls()
+
+    total_col, high_col, medium_col, contacted_col, closing_col, closed_col = st.columns(6)
+    total_col.metric("Total limpios", f"{stats['clean']:,}")
+    high_col.metric("Alta prioridad", f"{stats['high_priority']:,}")
+    medium_col.metric("Media prioridad", f"{stats['medium_priority']:,}")
+    contacted_col.metric("Contactados · Fase 1", f"{stats['contacted_phase_one']:,}")
+    closing_col.metric("En cierre · Fase 2", f"{stats['payment_proposal_sent']:,}")
+    closed_col.metric("Clientes cerrados", f"{stats['closed_clients']:,}")
+    st.caption(
+        "Total limpios incluye leads contactables de prioridad alta/media, excluye "
+        "bancos y financieras, y conserva las etapas del embudo tras recalificar."
+    )
+
+    priority_filter = st.selectbox(
+        "Prioridad",
+        ("Todas", "Alta", "Media"),
+        key="prospecting_priority_filter",
+    )
+    search_term = st.text_input(
+        "Buscar por negocio o mercado",
+        key="prospecting_search",
+        placeholder="Nombre del negocio o categoría",
+    )
+    visible_leads = [
+        lead
+        for lead in leads
+        if (
+            priority_filter == "Todas"
+            or str(lead["prioridad"]).upper().startswith(priority_filter.upper())
+        )
+        and (
+            not search_term.strip()
+            or search_term.casefold()
+            in f"{lead['nombre']} {lead['mercado']}".casefold()
+        )
+    ]
+    display_rows = [
+        {
+            "ID": lead["id"],
+            "Negocio": lead["nombre"],
+            "Prioridad": lead["prioridad"],
+            "Etapa": lead["funnel_status"],
+            "Mercado": lead["mercado"],
+            "Zona": lead["direccion"],
+            "Web": lead["web"],
+            "Email": lead["email"] or "—",
+            "Teléfono": lead["telefono"] or "—",
+        }
+        for lead in visible_leads
+    ]
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=min(460, max(180, len(display_rows) * 36 + 38)),
+    )
+    if not visible_leads:
+        st.info("No hay leads que coincidan con los filtros seleccionados.")
+        return
+
+    leads_by_id = {int(lead["id"]): lead for lead in visible_leads}
+    selected_id = st.selectbox(
+        "Selecciona un prospecto para preparar su propuesta",
+        list(leads_by_id),
+        format_func=lambda lead_id: (
+            f"{leads_by_id[lead_id]['nombre']} · "
+            f"{leads_by_id[lead_id]['mercado']} · ID {lead_id}"
+        ),
+        key="selected_prospect_id",
+    )
+    selected_lead = leads_by_id[selected_id]
+    existing_proposals = [
+        record
+        for record in state["prototypes"]
+        if record.get("lead_id") == selected_id
+    ]
+    with BACKGROUND_JOBS_LOCK:
+        proposal_is_running = any(
+            job.get("kind") == "lead_proposal"
+            and job.get("record_id") == str(selected_id)
+            and job.get("status") in ("queued", "running")
+            for job in BACKGROUND_JOBS.values()
+        )
+    if proposal_is_running:
+        st.info("La propuesta de este prospecto se está generando en segundo plano.")
+    elif existing_proposals:
+        latest_proposal = max(
+            existing_proposals,
+            key=lambda record: record.get("created_at", ""),
+        )
+        st.info(
+            "Este prospecto ya tiene un borrador: "
+            f"{STATUS_LABELS.get(latest_proposal.get('status'), latest_proposal.get('status'))}. "
+            "Revísalo en la Bandeja de Aprobación antes de generar otro."
+        )
+    st.write(
+        f"**Email:** {selected_lead['email'] or 'No disponible'}  \n"
+        f"**Teléfono:** {selected_lead['telefono'] or 'No disponible'}  \n"
+        f"**Web:** {selected_lead['web'] or 'No disponible'}"
+    )
+    try:
+        api_key = str(st.secrets["OPENAI_API_KEY"]).strip()
+    except (KeyError, FileNotFoundError):
+        api_key = ""
+    try:
+        model = str(st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")).strip()
+    except (FileNotFoundError, AttributeError):
+        model = "gpt-4o-mini"
+    if not api_key:
+        st.warning(
+            "Para habilitar la generación con IA, configura `OPENAI_API_KEY` en "
+            "Streamlit Secrets. No se enviarán propuestas automáticamente."
+        )
+    st.caption(
+        "El proveedor de IA recibe nombre del negocio, mercado, zona y web pública; "
+        "no recibe el correo ni el teléfono. El resultado se guarda en Pendientes y "
+        "solo se envía después de tu aprobación explícita."
+    )
+    if st.button(
+        "✨ Generar propuesta con IA y enviar a revisión",
+        type="primary",
+        use_container_width=True,
+        disabled=not api_key or bool(existing_proposals) or proposal_is_running,
+        key="generate_prospect_proposal",
+    ):
+        enqueue_background_job(
+            f"Propuesta IA para {selected_lead['nombre']}",
+            generate_and_store_lead_proposal,
+            dict(selected_lead),
+            api_key,
+            model or "gpt-4o-mini",
+            dict(state["settings"].get("payment_links", {})),
+            kind="lead_proposal",
+            record_id=str(selected_lead["id"]),
+        )
+        st.session_state["flash_message"] = (
+            f"Se inició la preparación del borrador para {selected_lead['nombre']}; "
+            "no se enviará sin aprobación."
+        )
+        st.rerun()
+
+
+def queue_scraper_job(label: str, script_name: str) -> None:
+    if scraper_job_is_active():
+        st.warning("Ya hay un motor de prospección en ejecución.")
+        return
+    enqueue_background_job(
+        label,
+        run_scraper_script,
+        script_name,
+        kind="scraper",
+        record_id=script_name,
+    )
+    st.session_state["flash_message"] = f"Motor en segundo plano: {label}."
+    st.rerun()
+
+
+def scraper_job_is_active() -> bool:
+    with BACKGROUND_JOBS_LOCK:
+        return any(
+            job.get("kind") == "scraper"
+            and job.get("status") in ("queued", "running")
+            for job in BACKGROUND_JOBS.values()
+        )
+
+
+def render_scraper_controls() -> None:
+    with st.expander("⚙️ Ejecutar Motores de Extracción y Limpieza"):
+        scraper_busy = scraper_job_is_active()
+        st.caption(
+            "Los motores operan sobre `apex_scraper/prospectos_apex_scraping.db`. "
+            "La purga elimina permanentemente filas bancarias; antes de ejecutarla "
+            "se crea un respaldo SQLite en `.ceo_dashboard/database_backups/`."
+        )
+        if scraper_busy:
+            st.info("Hay un motor activo; espera a que termine antes de iniciar otro.")
+        extract_col, enrich_col = st.columns(2)
+        with extract_col:
+            if st.button(
+                "🔎 Buscar nuevos prospectos",
+                key="run_scraper_extractor",
+                disabled=scraper_busy,
+                use_container_width=True,
+            ):
+                queue_scraper_job("Buscar nuevos prospectos", "extractor.py")
+        with enrich_col:
+            if st.button(
+                "✉️ Enriquecer emails y teléfonos",
+                key="run_scraper_enricher",
+                disabled=scraper_busy,
+                use_container_width=True,
+            ):
+                queue_scraper_job(
+                    "Enriquecer emails y teléfonos", "enriquecedor.py"
+                )
+
+        purge_confirmed = st.checkbox(
+            "Confirmo la eliminación permanente de bancos y financieras "
+            "(se guardará un respaldo antes de continuar).",
+            key="confirm_scraper_purge",
+        )
+        purge_col, score_col = st.columns(2)
+        with purge_col:
+            if st.button(
+                "🧹 Purgar bancos y financieras",
+                key="run_scraper_purge",
+                disabled=not purge_confirmed or scraper_busy,
+                use_container_width=True,
+            ):
+                queue_scraper_job(
+                    "Purgar bancos y financieras", "limpiar_bancos.py"
+                )
+        with score_col:
+            if st.button(
+                "📊 Recalificar Lead Scoring y exportar CSV",
+                key="run_scraper_scoring",
+                disabled=scraper_busy,
+                use_container_width=True,
+            ):
+                queue_scraper_job(
+                    "Recalificar Lead Scoring y exportar CSV", "cualificador.py"
+                )
+
+        pipeline_confirmed = st.checkbox(
+            "Confirmo el pipeline completo, incluida la purga irreversible "
+            "de bancos y financieras tras crear un respaldo.",
+            key="confirm_scraper_pipeline",
+        )
+        if st.button(
+            "▶️ Ejecutar Pipeline Completo en Cadena",
+            key="run_scraper_pipeline",
+            disabled=not pipeline_confirmed or scraper_busy,
+            type="primary",
+            use_container_width=True,
+        ):
+            enqueue_background_job(
+                "Pipeline completo de scraping y calificación",
+                run_scraper_pipeline,
+                kind="scraper",
+                record_id="pipeline",
+            )
+            st.session_state["flash_message"] = (
+                "Pipeline completo en segundo plano; la purga solo se ejecutará "
+                "después de crear el respaldo."
+            )
+            st.rerun()
+
+
+def enqueue_phase_two_email(
+    record: dict, recipient: str, settings: dict
+) -> None:
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient.strip()):
+        st.error("Introduce un correo válido para enviar la Fase 2.")
+        return
+    payment_links = settings.get("payment_links", {})
+    if not all(str(value).strip() for value in payment_links.values()):
+        st.error("Configura los datos oficiales de las tres pasarelas antes de enviar.")
+        return
+    enqueue_background_job(
+        f"Envío Fase 2 a {record['business_name']}",
+        dispatch_phase_two_proposal,
+        record["id"],
+        recipient.strip(),
+        f"Siguiente paso para activar {record['business_name']}",
+        proposal_phase_two(record, settings),
+        kind="phase_two",
+        record_id=record["id"],
+    )
+    st.success(f"Mensaje Fase 2 encolado para {record['business_name']}.")
+
+
 def render_approval_tab(state: dict) -> None:
     st.subheader("Bandeja de aprobación del CEO")
     st.warning(
@@ -1369,7 +2340,14 @@ def render_approval_tab(state: dict) -> None:
             title_col, status_col = st.columns([3, 1])
             with title_col:
                 st.markdown(f"### {record['business_name']}")
-                st.caption(f"{record['service']} · {record['zone']} · Prospecto simulado")
+                source_label = (
+                    f"Prospecto real · ID SQLite {record['lead_id']}"
+                    if record.get("lead_id") is not None
+                    else "Prospecto simulado"
+                )
+                st.caption(
+                    f"{record['service']} · {record['zone']} · {source_label}"
+                )
             with status_col:
                 st.markdown(
                     f"**{STATUS_LABELS.get(record['status'], record['status'])}**"
@@ -1407,7 +2385,9 @@ def render_approval_tab(state: dict) -> None:
                 st.code(phase_one_message, language="text")
                 email_url = email_action_link(
                     phase_one_message,
-                    "Tu prototipo personalizado",
+                    record.get(
+                        "proposal_subject", "Tu prototipo personalizado"
+                    ),
                     record.get("contact_email", ""),
                 )
                 st.link_button(
@@ -1437,6 +2417,24 @@ def render_approval_tab(state: dict) -> None:
                     ),
                     use_container_width=True,
                 )
+                if st.button(
+                    "💳 Enviar Links de Pago por SMTP Automático",
+                    key=f"send_phase_two_{key}",
+                    type="primary",
+                    disabled=(
+                        not payment_ready
+                        or not re.fullmatch(
+                            r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                            recipient_email.strip(),
+                        )
+                    ),
+                    use_container_width=True,
+                ):
+                    record["contact_email"] = recipient_email.strip()
+                    save_state(state)
+                    enqueue_phase_two_email(
+                        record, recipient_email, state["settings"]
+                    )
                 if not payment_ready:
                     st.caption(
                         "Configura los datos oficiales de cada pasarela en la barra lateral "
@@ -1444,7 +2442,8 @@ def render_approval_tab(state: dict) -> None:
                     )
                 else:
                     st.caption(
-                        "El botón abre un borrador en tu aplicación. Revísalo y envíalo manualmente."
+                        "Puedes abrir un borrador manual o despachar el mensaje por SMTP "
+                        "con el botón automático."
                     )
             if record.get("last_send_error"):
                 st.error(f"Último intento: {record['last_send_error']}")
@@ -1474,7 +2473,10 @@ def render_approval_tab(state: dict) -> None:
                             dispatch_approved_proposal,
                             record["id"],
                             record["contact_email"],
-                            f"Una idea para {record['business_name']}",
+                            record.get(
+                                "proposal_subject",
+                                f"Una idea para {record['business_name']}",
+                            ),
                             proposal_phase_one(record, share_url),
                             kind="approval",
                             record_id=record["id"],
@@ -1519,10 +2521,45 @@ def render_approval_tab(state: dict) -> None:
                 key=lambda item: item.get("approved_at", ""),
                 reverse=True,
             ):
-                st.markdown(
-                    f"- **{record['business_name']}** · {record['zone']} · "
-                    f"aprobado {record.get('approved_at', '')[:10]}"
-                )
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{record['business_name']}** · {record['zone']} · "
+                        f"aprobado {record.get('approved_at', '')[:10]}"
+                    )
+                    approved_email = st.text_input(
+                        "Correo del cliente",
+                        value=record.get("contact_email", ""),
+                        key=f"approved_contact_{record['id']}",
+                    )
+                    phase_two_message = proposal_phase_two(record, state["settings"])
+                    st.code(phase_two_message, language="text")
+                    approved_email_url = email_action_link(
+                        phase_two_message,
+                        f"Siguiente paso para activar {record['business_name']}",
+                        approved_email,
+                    )
+                    st.link_button(
+                        "Abrir correo — Mensaje 2 (Links de Pago)",
+                        approved_email_url,
+                        disabled=not approved_email.strip(),
+                        use_container_width=True,
+                    )
+                    if st.button(
+                        "💳 Enviar Links de Pago por SMTP Automático",
+                        key=f"send_approved_phase_two_{record['id']}",
+                        type="primary",
+                        disabled=not approved_email.strip()
+                        or not all(
+                            str(value).strip()
+                            for value in state["settings"]["payment_links"].values()
+                        ),
+                        use_container_width=True,
+                    ):
+                        record["contact_email"] = approved_email.strip()
+                        save_state(state)
+                        enqueue_phase_two_email(
+                            record, approved_email, state["settings"]
+                        )
                 show_prototype_preview(
                     record, f"approved_{record['id']}", state["settings"]
                 )
@@ -1892,6 +2929,20 @@ def render_finance_tab(state: dict) -> None:
                                         .isoformat(timespec="seconds")
                                     )
                         save_state(state)
+                        if payment_verified:
+                            try:
+                                contract["matched_leads"] = mark_matching_leads_as_closed(
+                                    contract["business_name"],
+                                    contract["customer_email"],
+                                )
+                                contract.pop("lead_sync_error", None)
+                            except RuntimeError as exc:
+                                contract["lead_sync_error"] = str(exc)
+                                st.session_state["flash_warning"] = (
+                                    f"El pago quedó verificado, pero no se pudo "
+                                    f"sincronizar el lead en SQLite: {exc}"
+                                )
+                            save_state(state)
                         st.session_state["flash_message"] = (
                             f"Control interno guardado para {contract.get('business_name')}."
                         )
@@ -2080,14 +3131,32 @@ def render_background_jobs() -> None:
                             record["last_send_error"] = str(exc)
                             save_state(state)
                     refresh_app = True
+                elif job["kind"] == "lead_proposal":
+                    refresh_app = True
             else:
-                if result:
+                if job["kind"] == "scraper":
+                    job["scraper_result"] = result
+                    return_code = int(result.get("returncode", 1))
+                    job["status"] = "succeeded" if return_code == 0 else "failed"
+                    job["result"] = (
+                        "Motor completado."
+                        if return_code == 0
+                        else f"El motor terminó con código {return_code}."
+                    )
+                    if return_code != 0:
+                        job["error"] = job["result"]
+                    refresh_app = True
+                elif result:
                     job["status"] = "warning"
                     job["warning"] = str(result)
                 else:
                     job["status"] = "succeeded"
                     job["result"] = "Tarea completada."
-                refresh_app = refresh_app or job["kind"] == "approval"
+                refresh_app = refresh_app or job["kind"] in (
+                    "approval",
+                    "lead_proposal",
+                    "phase_two",
+                )
         elif job["status"] == "queued" and future.running():
             job["status"] = "running"
         if job["status"] in ("succeeded", "warning", "failed") and job["kind"] == "ceo_alert":
@@ -2127,6 +3196,22 @@ def render_background_jobs() -> None:
                 st.warning(f"{job['label']}: {job['warning']}")
             else:
                 st.error(f"{job['label']}: {job['error']}")
+            if job.get("kind") == "scraper" and job.get("scraper_result"):
+                result = job["scraper_result"]
+                with st.expander(f"Ver salida: {job['label']}"):
+                    steps = (
+                        result.get("steps", [])
+                        if isinstance(result.get("steps"), list)
+                        else [result]
+                    )
+                    for step in steps:
+                        st.markdown(f"**{step.get('script', 'Motor')}**")
+                        if step.get("backup_path"):
+                            st.caption(f"Respaldo previo a la purga: {step['backup_path']}")
+                        if step.get("stdout"):
+                            st.code(step["stdout"], language="text")
+                        if step.get("stderr"):
+                            st.error(step["stderr"])
     if refresh_app:
         st.rerun()
 
@@ -2318,12 +3403,24 @@ def render_demo_view(
                     st.session_state[f"purchase_confirmation_{record['id']}"] = (
                         notification["id"]
                     )
+                    if notification.get("lead_sync_error"):
+                        st.session_state[
+                            f"purchase_sync_warning_{record['id']}"
+                        ] = notification["lead_sync_error"]
                     st.rerun()
     if st.session_state.get(f"purchase_confirmation_{record['id']}"):
         st.success(
             "Recibimos tu solicitud. Verificaremos el pago y te contactaremos; "
             "la activación se coordina después de esa verificación. La Nota de Entrega "
             "oficial se enviará cuando el sistema esté entregado y activo."
+        )
+    sync_warning = st.session_state.get(
+        f"purchase_sync_warning_{record['id']}"
+    )
+    if sync_warning:
+        st.warning(
+            "La solicitud quedó registrada, pero no se pudo sincronizar el embudo "
+            f"SQLite: {sync_warning}"
         )
 
     with st.container(border=True):
@@ -2503,18 +3600,24 @@ def main() -> None:
     flash = st.session_state.pop("flash_message", None)
     if flash:
         st.success(flash)
+    flash_warning = st.session_state.pop("flash_warning", None)
+    if flash_warning:
+        st.warning(flash_warning)
     render_recent_purchase_notifications(state)
 
     pending_count = pending_prototype_count(state)
-    factory_tab, approval_tab, finance_tab = st.tabs(
+    factory_tab, prospecting_tab, approval_tab, finance_tab = st.tabs(
         [
             "🏭 Lanzar Operación (Fábrica)",
+            "🔎 Prospección SQLite",
             f"🛡️ Bandeja de Aprobación ({pending_count})",
             "💰 Control Financiero y Mantenimiento ($)",
         ]
     )
     with factory_tab:
         render_factory_tab(state)
+    with prospecting_tab:
+        render_prospecting_tab(state)
     with approval_tab:
         render_approval_tab(state)
     with finance_tab:
